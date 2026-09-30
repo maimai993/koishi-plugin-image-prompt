@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-image-prompt",
   "description": "多功能 AI 图像处理插件，支持手办化、Coser化、Minecraft化等47种风格转换，并提供自定义提示词和多图融合功能",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
