@@ -347,12 +347,18 @@ rewrite 失败时自动退回 merge 的结果，不会因为优化失败而不�
 有 **5 分钟时效 + 次数上限**。而一次绘图要发好几条消息（选图中 → 处理中 → 提示词回显 → 结果图），
 每条都带引用必然超限。
 
-插件现在按下面两条规则处理，不需要你管：
+⚠️ **关键坑：去掉引用元素并不等于变成主动消息。** `koishi-plugin-adapter-qq-crack` 内部是
+`msg_id = session.messageId` —— 只要消息经过 `session.send()`，哪怕不带 `h.quote()`，
+也会被当成被动回复并递增 `msg_seq`，照样受时效/次数限制。**真正的主动消息只能走
+`bot.sendMessage(channelId, content, guildId)`（不经过 session）。**
 
-1. **同一条用户消息只允许引用一次**：第一条消息带引用（看起来是"回复你"），后续都是普通消息
-2. **引用被拒时自动降级**：捕获 40034128，去掉引用作为主动消息重发一次
+插件现在按下面三条规则处理，不需要你管：
 
-后台绘图最容易踩这个（出图要几分钟，早过时效了），完成通知的引用同样会自动降级。
+1. **同一条用户消息只引用一次**：第一条消息带引用（看起来是"回复你"），后续都是普通消息
+2. **被动回复有次数预算**：同一条消息最多走 3 次被动回复，用满自动改走主动消息
+3. **被动回复被拒时立刻降级**：捕获 40034128，改用 `bot.sendMessage` 发真正的主动消息
+
+后台绘图最容易踩这个（出图要几分钟，早过时效了），完成通知同样会自动降级。
 
 #### 再省一步：把提示合并成一条 markdown
 
@@ -367,7 +373,7 @@ rewrite 失败时自动退回 merge 的结果，不会因为优化失败而不�
     ```
     优化后的提示词（代码块）
     ```
-②  ![](https://...图片链接)   ← 实际是 ![#1024px #1024px](链接)
+②  ![](https://...图片链接)   ← 实际是 ![#400px #225px](链接)（自动按真实比例）
 ```
 
 第 ① 条是**在开始画图之前**就发出去的（不会让你在绘图期间干等、以为卡住了）；
@@ -376,7 +382,9 @@ rewrite 失败时自动退回 merge 的结果，不会因为优化失败而不�
 **关于结果图的两个坑：**
 
 - **必须带尺寸**：QQ 官方语法是 `![#宽px #高px](url)`，**不带尺寸手机端 QQ 不渲染**。
-  默认 1024×1024，非方形图在控制台里改成实际比例。
+  但**写死宽高会把非方形图拉伸变形**——所以插件默认开启「自动尺寸」：下载结果图读文件头
+  （PNG/GIF/JPEG/WebP 都支持，不解码整张图），按真实比例等比缩放到「显示宽度上限」（默认 400px）。
+  想手动指定就把「自动尺寸」关掉，再填「显示宽度 / 显示高度」（0 表示不限制）。
 - **最好走一次 assets**：绘图接口给的虽然是公网链接，但手机端 QQ 经常拉不到（防盗链/域名）。
   开启后先经 assets 服务（`koishi-plugin-assets-qqbot-part-file` 等）转成平台可访问的地址；
   上传失败会自动用原链接，不会更差。
@@ -386,7 +394,9 @@ rewrite 失败时自动退回 merge 的结果，不会因为优化失败而不�
 | 合并消息 | 把过程提示合并成一条 | 开 |
 | 结果图用 markdown | 支持 markdown 的平台用 `![#Wpx #Hpx](url)` 发结果 | 开 |
 | 结果图经 assets 上传 | 外链手机端常拉不到，转成平台地址 | 开 |
-| markdown 图片宽 / 高 | QQ 要求带尺寸 | 1024 / 1024 |
+| 结果图自动尺寸 | 读真实宽高、等比缩放，避免非方形图被拉伸 | 开 |
+| 显示宽度上限 | 自动尺寸时的最大宽度，高度按真实比例算 | 400 |
+| 手动宽 / 高 | 仅在关掉自动尺寸时生效，0 表示不限制 | 0 / 0 |
 
 细节：
 - 需要你**立刻回应**的提示（等你发图、等自定义提示词）会先把攒着的消息发出去再问
@@ -468,6 +478,24 @@ max_tokens=8000  → finish_reason: stop,   content: "{...}", reasoning_tokens: 
 
 ### Q: API 返回 429 或配额不足
 **A:** 检查账户额度，插件检测到配额不足会自动停止重试。
+
+### Q: 启动报 `ReferenceError: Cannot access 'galleryLoaded' before initialization`
+**A:** 这是 **1.0.4 及更早版本**的 bug，1.1.1 已修复，升级即可。
+
+原因：图库启动预热 `void loadGallery()` 写在了 `let galleryLoaded = false` **之前**。
+`loadGallery` 是 `async` 函数，函数体开头读 `galleryLoaded` 时变量还在「暂时性死区」，
+于是抛出的 `ReferenceError` 变成了**未处理的 Promise 拒绝**，日志里显示为 `[W] app`：
+
+```
+[W] app ReferenceError: Cannot access 'galleryLoaded' before initialization
+    at loadGallery (.../koishi-plugin-image-prompt/lib/index.js:1715:7)
+```
+
+它的表现是**图库/参考图检索静默失效**（后续报「两级检索未召回候选」「AI 选图失败」），
+而不是让机器人起不来 —— 所以容易被当成别的问题排查。修法很简单：把预热调用挪到声明之后。
+
+> 本仓库 `tests/apply-smoke.js` 就是专门防这个的：用真实 koishi Context 跑一遍
+> `apply` + `ready`，监听 `unhandledRejection`。跑 `node tests/apply-smoke.js` 即可验证。
 
 # 本插件基于[koishi-plugin-lmarena](https://github.com/HydroGest/lmarena)修改
 # 部分prompt来自[astrbot_plugin_lmarena](https://github.com/Zhalslar/astrbot_plugin_lmarena)

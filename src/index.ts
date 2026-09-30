@@ -318,6 +318,71 @@ export function buildMarkdownImage(url: string, width: number = 0, height: numbe
 }
 
 /**
+ * 从图片字节里读真实宽高（只看文件头，不解码整张图）。
+ * 支持 PNG / JPEG / GIF / WebP。
+ */
+export function readImageSize(input: any): { width: number, height: number } | null {
+  const buf = Buffer.isBuffer(input) ? input : Buffer.from(input || [])
+  if (buf.length < 24) return null
+
+  // PNG: 89 50 4E 47, IHDR 紧跟在 8 字节签名 + 4 字节长度 + 4 字节类型之后
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) {
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) }
+  }
+
+  // GIF: 逻辑屏幕宽高在偏移 6，小端
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) {
+    return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) }
+  }
+
+  // WebP: RIFF....WEBP，再按 VP8X / VP8 / VP8L 三种块头解析
+  if (buf.length > 30 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
+    const chunk = buf.toString('ascii', 12, 16)
+    if (chunk === 'VP8X') {
+      return { width: 1 + buf.readUIntLE(24, 3), height: 1 + buf.readUIntLE(27, 3) }
+    }
+    if (chunk === 'VP8 ') {
+      return { width: buf.readUInt16LE(26) & 0x3FFF, height: buf.readUInt16LE(28) & 0x3FFF }
+    }
+    if (chunk === 'VP8L') {
+      const bits = buf.readUInt32LE(21)
+      return { width: (bits & 0x3FFF) + 1, height: ((bits >> 14) & 0x3FFF) + 1 }
+    }
+  }
+
+  // JPEG: 逐段扫描 SOFn（C0-CF，排除 C4/C8/CC）
+  if (buf[0] === 0xFF && buf[1] === 0xD8) {
+    let offset = 2
+    while (offset + 9 < buf.length) {
+      if (buf[offset] !== 0xFF) { offset++; continue }
+      const marker = buf[offset + 1]
+      if (marker === 0xD8 || marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) { offset += 2; continue }
+      if (marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC) {
+        return { height: buf.readUInt16BE(offset + 5), width: buf.readUInt16BE(offset + 7) }
+      }
+      const length = buf.readUInt16BE(offset + 2)
+      if (length <= 0) break
+      offset += 2 + length
+    }
+  }
+
+  return null
+}
+
+/** 按真实比例算 markdown 显示尺寸（等比缩放到宽度上限） */
+export function fitImageSize(
+  size: { width: number, height: number } | null,
+  maxWidth: number,
+  fallback: { width: number, height: number }
+): { width: number, height: number } {
+  if (!size || !(size.width > 0) || !(size.height > 0)) return fallback
+  const limit = maxWidth > 0 ? maxWidth : size.width
+  if (size.width <= limit) return { width: Math.round(size.width), height: Math.round(size.height) }
+  const scale = limit / size.width
+  return { width: Math.round(limit), height: Math.max(1, Math.round(size.height * scale)) }
+}
+
+/**
  * 清洗模型生成的描述：去代码块围栏、去引号、压平换行、去掉「描述：」前缀、限长
  */
 export function sanitizeCaption(text: string, maxLen: number = 120): string {
@@ -782,7 +847,11 @@ interface CommandConfig {
   markdownImage?: boolean
   /** 结果图先经 assets 服务上传再发（外链在手机端 QQ 可能拉不到） */
   imageViaAssets?: boolean
-  /** markdown 图片的宽/高（QQ 要求带尺寸，否则手机端不渲染） */
+  /** 自动按图片真实比例生成 markdown 尺寸（关掉则用下面固定的宽高） */
+  autoImageSize?: boolean
+  /** 自动尺寸时的显示宽度上限 */
+  imageMaxWidth?: number
+  /** 固定宽/高（QQ 要求带尺寸，否则手机端不渲染） */
   imageWidth?: number
   imageHeight?: number
 }
@@ -1588,8 +1657,10 @@ export const Config: Schema = Schema.intersect([
     mergeNotifications: Schema.boolean().default(true).description('把「选图结果 / 正在处理 / 优化后提示词」合并成**一条**消息发出（QQ 被动回复有次数上限，消息越少越稳）'),
     markdownImage: Schema.boolean().default(true).description('生成结果用 markdown 的 ![](图片链接) 单独发一条；不支持 markdown 的平台自动退回普通图片消息'),
     imageViaAssets: Schema.boolean().default(true).description('结果图先经 assets 服务上传再发。外链在手机端 QQ 常常拉不到，装上 koishi-plugin-assets-qqbot-part-file 之类的 assets 插件后由它转成平台可访问的地址；上传失败会自动用原链接'),
-    imageWidth: Schema.number().default(1024).min(0).max(4096).step(32).description('markdown 图片的宽度（QQ 官方语法要求带尺寸，否则手机端不渲染）'),
-    imageHeight: Schema.number().default(1024).min(0).max(4096).step(32).description('markdown 图片的高度'),
+    autoImageSize: Schema.boolean().default(true).description('自动按**图片真实比例**生成 markdown 尺寸（填死宽高会把非方形图拉伸变形）'),
+    imageMaxWidth: Schema.number().default(400).min(64).max(2000).step(16).description('自动尺寸时的显示宽度上限，高度按真实比例算'),
+    imageWidth: Schema.number().default(0).min(0).max(4096).step(32).description('固定宽度（仅在关闭自动尺寸时生效；0 表示不带尺寸）'),
+    imageHeight: Schema.number().default(0).min(0).max(4096).step(32).description('固定高度（仅在关闭自动尺寸时生效）'),
   }).description('消息发送'),
 
   Schema.object({
@@ -1625,26 +1696,48 @@ export function apply(ctx: Context, config: CommandConfig) {
     })
   }
 
+  // 每个 messageId 已经用掉几次「被动回复」。QQ 对同一个 msg_id 有次数上限（约 5 次），
+  // 留点余量，超出就走主动消息。
+  const passiveUsed = new Map<string, number>()
+  const MAX_PASSIVE_REPLY = 3
+
   /**
-   * 发送一条消息。同一条用户消息**只允许引用一次**，之后的都是普通消息；
-   * 万一引用被拒（超时/超次），自动去掉引用重发一次。
+   * 主动消息：**不能走 session.send**。
+   * adapter 内部是 `msg_id = session.messageId`——只要经过 session，就算不带引用元素，
+   * 也会被当成被动回复并递增 msg_seq，照样受时效/次数限制。
+   * 只有 `bot.sendMessage` 这种不带 session 的发法才是真正的主动消息。
+   */
+  async function sendActive(session: Session, body: any[]): Promise<string[]> {
+    const result = await session.bot.sendMessage(session.channelId, body, session.guildId)
+    return Array.isArray(result) ? result : (result ? [String(result)] : [])
+  }
+
+  /**
+   * 发送一条消息：
+   * 1. 同一条用户消息**只引用一次**（第一条带引用，之后不带）
+   * 2. 被动回复用满 MAX_PASSIVE_REPLY 次后自动改走主动消息
+   * 3. 被动回复被拒（超时/超次）时立刻降级为主动消息
    */
   async function reply(session: Session, parts: any[], options: { quote?: boolean } = {}): Promise<string[]> {
     const body = parts.filter(Boolean)
     const key = `${session.platform}:${session.channelId || ''}:${session.messageId || ''}`
-    let useQuote = options.quote !== false && !!session.messageId && !quotedKeys.has(key)
+    const used = passiveUsed.get(key) || 0
 
-    if (useQuote) {
-      if (quotedKeys.size > 1000) quotedKeys.clear() // 防止无限增长
-      quotedKeys.add(key)
+    if (session.messageId && used < MAX_PASSIVE_REPLY) {
+      if (passiveUsed.size > 1000) passiveUsed.clear() // 防止无限增长
+      passiveUsed.set(key, used + 1)
+
+      const wantsQuote = options.quote !== false && !quotedKeys.has(key)
+      if (wantsQuote) quotedKeys.add(key)
       try {
-        return await session.send([h.quote(session.messageId), ...body])
+        return await session.send(wantsQuote ? [h.quote(session.messageId), ...body] : body)
       } catch (error) {
         if (!isPassiveReplyError(error)) throw error
-        ctx.logger.warn('引用回复被拒（被动回复超时或超次），改为普通消息重发')
+        ctx.logger.warn(`第 ${used + 1} 次被动回复被拒（超时或超次），改用主动消息发送`)
       }
     }
-    return session.send(body)
+
+    return sendActive(session, body)
   }
 
   /**
@@ -1673,14 +1766,36 @@ export function apply(ctx: Context, config: CommandConfig) {
     return url
   }
 
-  /** 发送生成结果：markdown 图片（带尺寸）；不支持或失败时退回普通图片消息 */
+  /** 下载结果图读真实宽高（只看文件头，不解码整张图） */
+  async function probeImageSize(url: string): Promise<{ width: number, height: number } | null> {
+    try {
+      const file = await ctx.http.file(url)
+      const size = readImageSize(file?.data)
+      if (size) logInfo(`结果图真实尺寸: ${size.width}x${size.height}`)
+      else ctx.logger.warn('读不出结果图尺寸，将按默认比例显示')
+      return size
+    } catch (error) {
+      ctx.logger.warn(`下载结果图取尺寸失败: ${error}`)
+      return null
+    }
+  }
+
+  /** 发送生成结果：markdown 图片（按真实比例带尺寸）；不支持或失败时退回普通图片消息 */
   async function sendResultImage(session: Session, url: string, commandName: string): Promise<void> {
     const finalUrl = await resolveImageUrl(url, commandName)
+
     if (config.markdownImage !== false && supportsMarkdown(session.platform)) {
+      // QQ 要求带尺寸，但写死宽高会把非方形图拉变形 —— 默认按真实比例等比缩放
+      let display = { width: config.imageWidth || 0, height: config.imageHeight || 0 }
+      if (config.autoImageSize !== false) {
+        const maxWidth = config.imageMaxWidth || 400
+        const real = await probeImageSize(url)
+        display = fitImageSize(real, maxWidth, { width: maxWidth, height: maxWidth })
+        logInfo(`markdown 图片尺寸: ${display.width}x${display.height}`)
+      }
+
       try {
-        await reply(session, [h('markdown', buildMarkdownImage(
-          finalUrl, config.imageWidth || 1024, config.imageHeight || 1024
-        ))])
+        await reply(session, [h('markdown', buildMarkdownImage(finalUrl, display.width, display.height))])
         return
       } catch (error) {
         ctx.logger.warn(`markdown 图片发送失败，退回普通图片消息: ${error}`)
@@ -1753,8 +1868,9 @@ export function apply(ctx: Context, config: CommandConfig) {
 
     ctx.command(config.basename)
 
-    // 启动时把已入库的生成结果读进内存，供后续检索
-    void loadGallery()
+    // 注意：图库启动预热（void loadGallery()）不能放在这里 ——
+    // galleryLoaded 是下面用 let 声明的，先调用会触发 TDZ
+    // 「Cannot access 'galleryLoaded' before initialization」。预热挪到图库声明之后。
 
     for (const cmdConfig of config.nested.commands) {
       if (!cmdConfig.enabled) continue;
@@ -2436,6 +2552,10 @@ export function apply(ctx: Context, config: CommandConfig) {
         galleryRecords = []
       }
     }
+
+    // 启动时把已入库的生成结果读进内存，供后续检索。
+    // 必须放在 galleryLoaded / loadGallery 的声明之后，否则会踩 let 的暂时性死区
+    void loadGallery()
 
     async function persistGallery(): Promise<void> {
       try {

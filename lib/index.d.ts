@@ -73,6 +73,25 @@ export declare function buildPromptBlock(promptText: string, maxLength?: number)
  */
 export declare function buildMarkdownImage(url: string, width?: number, height?: number): string;
 /**
+ * 从图片字节里读真实宽高（只看文件头，不解码整张图）。
+ * 支持 PNG / JPEG / GIF / WebP。
+ */
+export declare function readImageSize(input: any): {
+    width: number;
+    height: number;
+} | null;
+/** 按真实比例算 markdown 显示尺寸（等比缩放到宽度上限） */
+export declare function fitImageSize(size: {
+    width: number;
+    height: number;
+} | null, maxWidth: number, fallback: {
+    width: number;
+    height: number;
+}): {
+    width: number;
+    height: number;
+};
+/**
  * 清洗模型生成的描述：去代码块围栏、去引号、压平换行、去掉「描述：」前缀、限长
  */
 export declare function sanitizeCaption(text: string, maxLen?: number): string;
@@ -179,7 +198,11 @@ interface CommandConfig {
     markdownImage?: boolean;
     /** 结果图先经 assets 服务上传再发（外链在手机端 QQ 可能拉不到） */
     imageViaAssets?: boolean;
-    /** markdown 图片的宽/高（QQ 要求带尺寸，否则手机端不渲染） */
+    /** 自动按图片真实比例生成 markdown 尺寸（关掉则用下面固定的宽高） */
+    autoImageSize?: boolean;
+    /** 自动尺寸时的显示宽度上限 */
+    imageMaxWidth?: number;
+    /** 固定宽/高（QQ 要求带尺寸，否则手机端不渲染） */
     imageWidth?: number;
     imageHeight?: number;
 }
