@@ -38,15 +38,21 @@ export const usage = `
    若开启「缺少合适参考图时询问用户补充发送」，会请用户补发一张参考图（用户发的图会被直接使用）。
    想回到老行为就把「选图模式」改成「旧版」。
 5. 当用户明确说「不用参考 / 随意画 / 自由发挥」时，直接跳过选图，一次选图请求都不发。
-6. 「启用 AI 智能选择参考图片」默认关闭，需手动开启；「AI 选图失败时回退为使用候选池内全部图片」默认关闭，
+6. 指令一触发就先回一条「收到，正在准备...」（「消息发送 → 收到提示」，默认开）。
+   后面的优化提示词 + 选图是两轮模型请求，可能要几十秒，不发这条用户会以为机器人卡死。
+7. **开画前确认**（「消息发送 → 开画前请用户确认」，默认开）：AI 挑完参考图先不画，
+   把「本次会参考哪几张图」列出来，回复「确认」才开画（超时或回别的都算取消）。
+   不想多这一步就关掉，或在单个指令上设成「选好图直接开画」。
+8. 「启用 AI 智能选择参考图片」默认关闭，需手动开启；「AI 选图失败时回退为使用候选池内全部图片」默认关闭，
    失败时本次不使用参考图片（开启则改用候选池内全部图片）。注意「回退」只对**请求失败**生效，
    对「打分不达标」不生效 —— 后者就该不带参考图。
-7. 「旧版」模式下参考图较多时（超过 12 张）自动走两级检索：先让模型产出检索关键词、本地匹配召回，
+9. 「旧版」模式下参考图较多时（超过 12 张）自动走两级检索：先让模型产出检索关键词、本地匹配召回，
    再对召回结果精排；识图模式下也只发送召回的这几张图片，避免每次都把整个图库发给模型。
-8. 描述可以用「生成描述」指令让模型看图自动生成并写回配置（需要支持图片输入的模型）。
-   若选图模型支持识别图片（多模态），可勾选「选图模型支持识别图片」，插件会把候选图片本身发给模型，
-   模型对着真实图片挑选；它给出的关键视觉特征还会并入绘图提示词，让出图更还原参考图。
-9. 生成结果可自动入库（默认关闭），下次能被自己检索到并复用，形成闭环；
+10. 描述可以用「生成描述」指令让模型看图自动生成并写回配置（需要支持图片输入的模型）。
+   若选图模型支持识别图片（多模态），可勾选「选图模型支持识别图片」，插件会把候选图片**自己下载后转 base64**
+   再发给模型（直接丢链接的话，模型服务端拉不到就会整条请求 400），模型对着真实图片挑选；
+   它给出的关键视觉特征还会并入绘图提示词，让出图更还原参考图。
+11. 生成结果可自动入库（默认关闭），下次能被自己检索到并复用，形成闭环；
    开启「后台绘图」后出图不再阻塞，先回「正在画」，画好主动推送。
 
 提示词模板可用占位符：{candidates} 候选图片列表、{userInput} 用户附加需求、{max} 最多选择数量、{command} 指令名、{prompt} 指令提示词
@@ -283,6 +289,37 @@ export function isSkipReferenceInput(userInput: string): boolean {
   return SKIP_REFERENCE_RE.test(text)
 }
 
+/**
+ * 兜住「需求分析」模型爱乱加的废话。
+ *
+ * 实测模型会把 needTypes 写成
+ * 「能发一张你想用的自己形象的参考图吗？顺便说说 DeepSeek 画成鲸鱼可以吗？」——
+ * 后半句是凭空瞎聊，用户看了莫名其妙。这里只保留第一句、去掉换行和 markdown 修饰、
+ * 限制长度，把「询问补图」这件事还原成一句话。
+ */
+export function sanitizeAskMessage(raw: string | null | undefined, max = 40): string {
+  let text = String(raw ?? '').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  // 只留第一句：句末标点（中文/英文）之后的内容全部丢掉
+  const first = text.match(/^[^。！？!?；;]*[。！？!?；;]?/)
+  if (first) text = first[0].trim()
+  // 去掉 markdown 记号与包裹引号
+  text = text.replace(/^[-*>#\s]+/, '').replace(/^["'“”「」『』]+/, '').replace(/["'“”「」『』]+$/, '').trim()
+  if (text.length > max) text = text.slice(0, max) + '…'
+  return text
+}
+
+/** 确认绘图的回复：只认「就是这一句」的短回复，避免把正常聊天当确认 */
+const CONFIRM_RE = /^(确认|确定|可以|好的|好|行|嗯|是|是的|开始|开画|画吧|继续|ok|okay|yes|y|1|\+1)$/i
+
+export function isConfirmInput(raw: string | null | undefined): boolean {
+  const text = String(raw ?? '')
+    .replace(/[\s\u3000]+/g, '')
+    .replace(/[!！。.,，~～?？:：]+$/g, '')
+  if (!text || text.length > 12) return false
+  return CONFIRM_RE.test(text)
+}
+
 /** 解析「需求抽取」的返回 */
 export function parseAnalysisResult(raw: string | null): RequirementAnalysis | null {
   const data = extractJsonObject(raw)
@@ -295,7 +332,7 @@ export function parseAnalysisResult(raw: string | null): RequirementAnalysis | n
     avoid: toStrList(data.avoid ?? data.exclude ?? data.negative ?? data.不要出现),
     text: Array.isArray(text) ? toStrList(text).join('\n') : String(text ?? '').trim(),
     skipReference: data.skipReference === true || data.skip_reference === true,
-    needTypes: String(data.needTypes ?? data.need_types ?? data.需要的图 ?? '').trim(),
+    needTypes: sanitizeAskMessage(data.needTypes ?? data.need_types ?? data.需要的图 ?? ''),
   }
 }
 
@@ -895,12 +932,16 @@ export function withTokenParam(body: any, param: string): any {
  * @param candidates 候选图片
  * @param vision 是否附带图片
  * @param visionMaxImages 最多附带多少张图片
+ * @param dataUrls 已经自己下载好的 base64 data URL（按 candidates 下标）。**传了它之后，
+ *   没下载成功的图就不再发原始链接了** —— 上游拉不到那个链接会整条请求 400，
+ *   连文字描述一起废掉；只发描述反而还能用。
  */
 export function buildSelectorContent(
   text: string,
   candidates: CandidateImage[],
   vision: boolean,
-  visionMaxImages: number
+  visionMaxImages: number,
+  dataUrls?: (string | undefined)[]
 ): string | any[] {
   if (!vision) return text
 
@@ -909,7 +950,8 @@ export function buildSelectorContent(
   candidates.forEach((candidate, index) => {
     parts.push({ type: 'text', text: `[${index + 1}] 所属组：${candidate.group} | 描述：${candidate.description || '（无描述）'}` })
     if (index < max) {
-      parts.push({ type: 'image_url', image_url: { url: candidate.url } })
+      const url = dataUrls ? dataUrls[index] : candidate.url
+      if (url) parts.push({ type: 'image_url', image_url: { url } })
     }
   })
   const hintRule = visionMaxImages && candidates.length > 1
@@ -1026,6 +1068,8 @@ interface CommandConfig {
       aiSelect?: boolean
       aiMaxSelect?: number
       aiAskUser?: boolean
+      /** 该指令是否在开画前请用户确认：'follow' 跟随全局 / 'on' 总是确认 / 'off' 从不确认 */
+      confirmBeforeDraw?: 'follow' | 'on' | 'off' | boolean
     }[]
   }
   defaultWaitTimeout: number
@@ -1047,6 +1091,12 @@ interface CommandConfig {
   textRender?: TextRenderConfig
   /** 把处理过程中的多条提示合并成一条消息发出（省被动消息额度） */
   mergeNotifications?: boolean
+  /** 指令一触发就立刻回一条「收到」，避免用户以为卡住 */
+  ackOnStart?: boolean
+  /** AI 选好参考图后先请用户确认再开画 */
+  confirmBeforeDraw?: boolean
+  /** 等待用户确认的时间（秒） */
+  confirmTimeout?: number
   /** 结果图用 markdown 的 ![](url) 单独发一条（支持的平台） */
   markdownImage?: boolean
   /** 结果图先经 assets 服务上传再发（外链在手机端 QQ 可能拉不到） */
@@ -1150,6 +1200,8 @@ interface AISelectorConfig {
   notify: boolean
   vision: boolean
   visionMaxImages: number
+  /** 识图时单张候选图的体积上限（MB），超过就只发文字描述 */
+  visionMaxImageBytes?: number
   visionFallback: boolean
   appendHint: boolean
   twoStage: boolean
@@ -1299,6 +1351,7 @@ const DEFAULT_ANALYZE_PROMPT = `你是绘图参考图的「需求分析助手」
 6. skipReference：用户明确表示「不用参考 / 随意画 / 自由发挥 / 你看着办」时为 true。
 7. needTypes：图库里**没有**合适参考图时，插件要请用户补发一张。这里写一句**直接对用户说**的话
    （中文，40 字以内，语气自然，不要用「请提供图片」这种套话），例如「能发一张白发水手服的立绘吗？」。
+   **只写这一句**：不要追问第二件事、不要闲聊、不要提到模型名字（如 DeepSeek）、不要写「顺便说说」之类的话。
    图库里不缺图就留空字符串。
 
 只输出一个 JSON 对象，不要解释、不要 Markdown 代码块：
@@ -1784,7 +1837,12 @@ export const Config: Schema = Schema.intersect([
           referenceGroups: Schema.array(Schema.string()).description('引用的参考图片组名称（AI 将从这些组中挑选图片，留空则由「AI 选图设置」决定是否使用全部组）').default([]),
           aiSelect: Schema.boolean().default(true).description('启用 AI 智能选择参考图片'),
           aiMaxSelect: Schema.number().default(0).min(0).max(10).step(1).description('AI 最多为该指令选择的参考图片数量（0 = 跟随「AI 选图设置」里的全局数量）'),
-          aiAskUser: Schema.boolean().default(true).description('缺少合适参考图时询问用户补充发送')
+          aiAskUser: Schema.boolean().default(true).description('缺少合适参考图时询问用户补充发送'),
+          confirmBeforeDraw: Schema.union([
+            Schema.const('follow').description('跟随全局设置'),
+            Schema.const('on').description('开画前请用户确认'),
+            Schema.const('off').description('选好图直接开画'),
+          ]).default('follow').description('该指令是否在开画前请用户确认'),
         })).description('指令配置').default(defaultCommands),
     }).collapse().description('指令配置项太长啦，这样折叠起来更方便哦~'),
 
@@ -1866,6 +1924,7 @@ export const Config: Schema = Schema.intersect([
       notify: Schema.boolean().default(true).description('在处理提示中附带 AI 选图结果'),
       vision: Schema.boolean().default(false).description('选图模型支持识别图片（多模态/VL）。开启后会把候选图片本身一起发给模型，而不只是发文字描述，选得更准（需要图片链接能被模型访问）'),
       visionMaxImages: Schema.number().default(6).min(1).max(20).step(1).description('开启识别图片时，最多附带多少张候选图片（超出部分只发文字描述，避免请求过大）'),
+      visionMaxImageBytes: Schema.number().default(4).min(0).max(32).step(1).description('识图时单张候选图的体积上限（MB）。插件会先把图片自己下载下来转成 base64 再发给选图模型（上游拉不到你的图片链接时会整条请求 400），超过上限的只发文字描述'),
       visionFallback: Schema.boolean().default(true).description('带图片请求失败时，自动退回纯文字再试一次'),
       appendHint: Schema.boolean().default(true).description('把模型看图后给出的关键视觉特征并入绘图提示词（仅在开启识别图片时生效，让出图更还原参考图）'),
       twoStage: Schema.boolean().default(true).description('【仅旧版模式生效】两级检索选图：先让模型产出检索关键词并在本地召回，再对召回结果精排。打分制已内置召回，无需此项'),
@@ -1934,6 +1993,9 @@ export const Config: Schema = Schema.intersect([
 
   Schema.object({
     mergeNotifications: Schema.boolean().default(true).description('把「选图结果 / 正在处理 / 优化后提示词」合并成**一条**消息发出（QQ 被动回复有次数上限，消息越少越稳）'),
+    ackOnStart: Schema.boolean().default(true).description('指令一触发就立刻回一条「收到，正在准备...」。后面的「优化提示词 + AI 选图」是两轮模型请求、可能要几十秒，不发这条用户会以为机器人卡住了'),
+    confirmBeforeDraw: Schema.boolean().default(true).description('AI 选好参考图后**先请用户确认再开始画**（把「本次参考这几张图」列出来，回复「确认」才画）。可防止选错参考图白画一张'),
+    confirmTimeout: Schema.number().default(60).min(5).max(300).step(5).description('等待用户确认的时间（秒），超时按取消处理；0 = 不限时'),
     markdownImage: Schema.boolean().default(true).description('生成结果用 markdown 的 ![](图片链接) 单独发一条；不支持 markdown 的平台自动退回普通图片消息'),
     imageViaAssets: Schema.boolean().default(true).description('结果图先经 assets 服务上传再发。外链在手机端 QQ 常常拉不到，装上 koishi-plugin-assets-qqbot-part-file 之类的 assets 插件后由它转成平台可访问的地址；上传失败会自动用原链接'),
     autoImageSize: Schema.boolean().default(true).description('自动按**图片真实比例**生成 markdown 尺寸（填死宽高会把非方形图拉伸变形）'),
@@ -2080,7 +2142,33 @@ export function apply(ctx: Context, config: CommandConfig) {
         ctx.logger.warn(`markdown 图片发送失败，退回普通图片消息: ${error}`)
       }
     }
-    await reply(session, [h.image(finalUrl)])
+    // 退回的普通图片消息也走「下载字节再发」：把外链丢给平台，
+    // 平台自己拉不到时会报 [40093007] 富媒体文件下载失败。
+    await reply(session, [await buildResultImagePart(finalUrl)])
+  }
+
+  /**
+   * 结果图优先用「自己下载好的字节」发。
+   *
+   * 给平台一个外链，是让平台服务器自己去下载它 —— 手机端 QQ 拉不到绘图接口给的链接时
+   * 就报 `[40093007] 富媒体文件下载失败`。把字节交给适配器上传就没这个问题。
+   * 下载失败再退回发原始链接（至少不比现在更差）。
+   */
+  async function buildResultImagePart(url: string): Promise<any> {
+    try {
+      const file = await ctx.http.file(url)
+      const data = file?.data
+      if (data) {
+        const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data)
+        if (buffer.length) {
+          logInfo(`结果图已下载（${(buffer.length / 1024).toFixed(0)}kB），按字节发送`)
+          return h.image(buffer, file?.mime || 'image/png')
+        }
+      }
+    } catch (error) {
+      ctx.logger.warn(`结果图下载失败，改发原始链接: ${error}`)
+    }
+    return h.image(url)
   }
 
   /** 后台任务用 bot 直接发消息（没有 session）：引用失败时同样降级 */
@@ -2115,6 +2203,10 @@ export function apply(ctx: Context, config: CommandConfig) {
           customprompt: '请在{0}秒内输入自定义提示词...',
           invalidimage: '未检测到有效的图片，请重新发送带图片的消息',
           processing: '正在处理图片，请稍候...',
+          ack: '收到，正在准备...',
+          confirmask: '准备开始绘图，本次会参考：\n{0}\n\n回复「确认」开始画（{1} 秒内未确认则取消）',
+          confirmcancel: '未收到确认，已取消本次绘图',
+          confirmok: '已确认，开始绘图...',
           failed: '图片生成失败，请稍后重试',
           error: '处理过程中发生错误，请稍后重试',
           needprompt: '请提供自定义提示词',
@@ -2189,6 +2281,17 @@ export function apply(ctx: Context, config: CommandConfig) {
             userInputText = stripCommandName(extractTextFromMessage(session.stripped.content), cmdConfig.name)
           }
           logInfo(`用户附加需求: ${userInputText || '（无）'}`)
+
+          // ============ 立刻回一条「收到」 ============
+          // 后面「优化提示词 + AI 选图」是两轮模型请求，加起来可能要几十秒，
+          // 期间一句话都不发，用户会以为机器人在卡死（连指令有没有被识别都不知道）。
+          if (config.ackOnStart !== false) {
+            try {
+              await reply(session, [session.text('image-prompt.messages.ack')])
+            } catch (error) {
+              ctx.logger.warn(`发送「收到」提示失败: ${error}`)
+            }
+          }
 
           // ============ 合并消息（省 QQ 被动消息额度） ============
           // 「正在选图 / 处理中 / 优化后的提示词」先攒着，最后合成一条发出去。
@@ -2275,6 +2378,8 @@ export function apply(ctx: Context, config: CommandConfig) {
           let selectionNote = ''
           let aiProvidedImages = 0 // AI 选中的参考图数量（计入「还需用户提供」的抵扣）
           let aiRenderText = '' // 选图模型认为画面上要出现的文字（台词/标题/字幕）
+          // 本次要参考的图片清单（给「开画前确认」用）
+          const refDescs: string[] = []
           if (aiSelectOn) {
             const candidates = collectCandidates(cmdConfig, defaultImageUrls)
             const declaredGroups = (cmdConfig.referenceGroups || []).filter(Boolean)
@@ -2323,6 +2428,7 @@ export function apply(ctx: Context, config: CommandConfig) {
               if (selection.ok && selection.picked.length > 0) {
                 images.push(...selection.picked.map(c => c.url))
                 aiProvidedImages += selection.picked.length
+                for (const c of selection.picked) refDescs.push(`【图库】${c.description || c.url}`)
                 logInfo(`AI 选中参考图片: ${selection.picked.map(c => c.url).join(' , ')} 理由: ${selection.reason}`)
 
                 // 模型看图后给出的特征/画面编排并入绘图提示词（仅识别图片模式）
@@ -2397,6 +2503,7 @@ export function apply(ctx: Context, config: CommandConfig) {
           const sessionImages = extractImagesFromSession(session)
           const extractedImages = [...sessionImages, ...userImages]
           images.push(...extractedImages)
+          extractedImages.forEach((_, i) => refDescs.push(`【你发送的】第 ${i + 1} 张`))
 
           // 计算还需要用户提供的图片数量（AI 选中的参考图也算数，已有图就不再追问）
           const providedImages = extractedImages.length + aiProvidedImages
@@ -2418,6 +2525,7 @@ export function apply(ctx: Context, config: CommandConfig) {
                 if (promptContent !== undefined) {
                   const newImages = extractImagesFromMessage(promptContent)
                   images.push(...newImages)
+                  newImages.forEach(() => refDescs.push('【你发送的】补发的图'))
                 } else {
                   break
                 }
@@ -2464,6 +2572,15 @@ export function apply(ctx: Context, config: CommandConfig) {
             ? ''
             : buildPromptBlock(promptText, config.promptMaxLength || 4000)
 
+          // 开画前是否要用户确认：指令级 'on'/'off' 覆盖全局，'follow'/未填跟随全局
+          const confirmMode = cmdConfig.confirmBeforeDraw
+          const confirmOn = confirmMode === 'off' || confirmMode === false
+            ? false
+            : confirmMode === 'on' || confirmMode === true
+              ? true
+              : config.confirmBeforeDraw !== false
+          const confirmTimeout = typeof config.confirmTimeout === 'number' ? config.confirmTimeout : 60
+
           try {
             if (config.mergeNotifications === false) {
               await reply(session, [session.text('image-prompt.messages.processing') + selectionNote
@@ -2494,6 +2611,27 @@ export function apply(ctx: Context, config: CommandConfig) {
               return
             }
 
+            // ============ 开画前确认 ============
+            // 到这一步 AI 已经把参考图挑完了。直接把画发出去太亏 —— 万一挑错，
+            // 用户只能白等一张图。所以先把「这次会参考哪几张」摆出来，回复「确认」才开画。
+            if (confirmOn) {
+              const refList = refDescs.length
+                ? refDescs.map((desc, i) => `${i + 1}. ${desc}`).join('\n')
+                : `（图库里没有匹配的参考图，将按提示词生成，共 ${files.length} 张输入）`
+              notify(session.text('image-prompt.messages.confirmask', [
+                refList,
+                confirmTimeout > 0 ? String(confirmTimeout) : '不限',
+              ]))
+              // 必须先把清单发出去：用户得知道自己在确认什么
+              await flushNotice()
+              const confirmed = await waitForConfirm(session, confirmTimeout)
+              if (!confirmed) {
+                await reply(session, [session.text('image-prompt.messages.confirmcancel')])
+                return
+              }
+              notify(session.text('image-prompt.messages.confirmok'))
+            }
+
             // 后台绘图：先把消息还给用户，出图在后台跑，完成后主动推送
             if (config.backgroundDrawing?.enabled) {
               const snapshot = {
@@ -2510,8 +2648,9 @@ export function apply(ctx: Context, config: CommandConfig) {
                 }
               }
               const queued = enqueueDrawJob(snapshot, files)
-              notify(`${session.text('image-prompt.messages.bgstart', [files.length])}${queued > 0 ? session.text('image-prompt.messages.bgqueue', [queued]) : ''}${selectionNote}`)
-              notify(promptEcho)
+              // 只补「已开始后台绘图」这一行。**不要**再把 selectionNote / promptEcho
+              // 加一遍 —— 上面已经进过 noticeLines 队列了，再加就会连同提示词一起发两遍。
+              notify(`${session.text('image-prompt.messages.bgstart', [files.length])}${queued > 0 ? session.text('image-prompt.messages.bgqueue', [queued]) : ''}`)
               await flushNotice()
               return
             }
@@ -2571,7 +2710,7 @@ export function apply(ctx: Context, config: CommandConfig) {
           return
         }
         await saveToGallery(result, buildGalleryDescription(snapshot.promptText, ''), snapshot.commandName)
-        await send([`${snapshot.texts.done}\n`, h.image(result)])
+        await send([`${snapshot.texts.done}\n`, await buildResultImagePart(result)])
       } catch (error) {
         ctx.logger.error(`[${snapshot.commandName}] 后台绘图失败:`, error)
         try {
@@ -3190,8 +3329,13 @@ export function apply(ctx: Context, config: CommandConfig) {
         .replace(/\{max\}/g, String(max))
 
       const visionOn = selector.vision === true
+      // 识图模式：候选图先自己下载成 base64。直接把原 URL 交给上游，
+      // 上游拉不到（私有 CDN / 防盗链）会整条请求 400，连文字描述一起废掉。
+      const inlined = visionOn
+        ? await inlineCandidateImages(shortlist, selector.visionMaxImages || 6)
+        : undefined
       const scoreUserContent = buildSelectorContent(
-        scoreContent, shortlist, visionOn, selector.visionMaxImages || 6
+        scoreContent, shortlist, visionOn, selector.visionMaxImages || 6, inlined
       )
       const scoreCall = await callSelectorModel(
         scoreUserContent, scoreContent, visionOn, selector.selectMaxTokens || 8000,
@@ -3234,6 +3378,53 @@ export function apply(ctx: Context, config: CommandConfig) {
         renderText: analysis.text || undefined,
         hint: visionOn && selector.appendHint !== false ? hint : undefined,
       }
+    }
+
+    /**
+     * 识图模式用：把候选图自己下载成 base64 data URL。
+     *
+     * 不能直接把图片链接丢给上游模型 —— 上游是它自己去下载的，
+     * 碰到私有 CDN / 防盗链（实测 pro.filesystem.site 就是）就会返回
+     * 「Failed to download image from ...」并让**整条请求 400**，
+     * 于是只能退回纯文字选图，识图功能白开。
+     *
+     * 下载失败或图片过大的，对应位置留 undefined → buildSelectorContent 只发文字描述。
+     * @returns 与 candidates 同下标的 data URL 数组
+     */
+    async function inlineCandidateImages(
+      candidates: CandidateImage[],
+      max: number
+    ): Promise<(string | undefined)[]> {
+      const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
+      const cap = (selector.visionMaxImageBytes || 4) * 1024 * 1024
+      const out: (string | undefined)[] = new Array(candidates.length)
+      const limit = max > 0 ? Math.min(max, candidates.length) : candidates.length
+
+      await Promise.all(candidates.map(async (candidate, index) => {
+        if (index >= limit) return
+        const brief = (candidate.url || '').slice(0, 80)
+        try {
+          const file = await ctx.http.file(candidate.url)
+          const data = file?.data
+          if (!data) throw new Error('没有拿到图片数据')
+          const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data)
+          if (!buffer.length) throw new Error('图片是空的')
+          if (buffer.length > cap) {
+            ctx.logger.warn(
+              `候选图 ${(buffer.length / 1048576).toFixed(1)}MB 超过上限 `
+              + `${(cap / 1048576).toFixed(1)}MB，识图时只发文字描述：${brief}`
+            )
+            return
+          }
+          out[index] = `data:${file?.mime || 'image/jpeg'};base64,${buffer.toString('base64')}`
+        } catch (error) {
+          ctx.logger.warn(`候选图下载失败，识图时只发文字描述：${brief}（${error}）`)
+        }
+      }))
+
+      const ok = out.filter(Boolean).length
+      logInfo(`识图候选图已内联 ${ok}/${limit} 张（其余只发文字描述）`)
+      return out
     }
 
     /** 候选图片索引文本 */
@@ -3310,8 +3501,12 @@ export function apply(ctx: Context, config: CommandConfig) {
         .replace(/\{prompt\}/g, promptText || '')
 
       // 支持识别图片时，把候选图片本身一起发给模型（编号文字 + 图片交替）
+      // 图片先自己下载转 base64：上游拉不到原链接会整条请求 400
       const visionOn = selector.vision === true
-      const userContent = buildSelectorContent(content, candidates, visionOn, selector.visionMaxImages || 6)
+      const inlined = visionOn
+        ? await inlineCandidateImages(candidates, selector.visionMaxImages || 6)
+        : undefined
+      const userContent = buildSelectorContent(content, candidates, visionOn, selector.visionMaxImages || 6, inlined)
 
       const { raw, error } = await callSelectorModel(
         userContent, content, visionOn, selector.selectMaxTokens || 8000
@@ -3481,6 +3676,29 @@ export function apply(ctx: Context, config: CommandConfig) {
           ctx.logger.warn(`在频道 ${session.channelId} 尝试撤回消息ID ${msgId} 失败。`)
         }
       }
+    }
+
+    /**
+     * 等用户确认开画。
+     * 复用「等你发图」那套 session.prompt：拿到用户在这个频道的下一条消息再判断。
+     * 超时、或者回了别的话，都算取消（宁可让用户重发指令，也不要画错一张）。
+     */
+    async function waitForConfirm(session: Session, timeoutSec: number): Promise<boolean> {
+      let answer: string | undefined
+      try {
+        answer = await session.prompt((timeoutSec > 0 ? timeoutSec : 600) * 1000)
+      } catch (error) {
+        ctx.logger.warn(`等待确认时出错: ${error}`)
+        return false
+      }
+      if (answer === undefined || answer === null) {
+        logInfo(`等待确认超时（${timeoutSec} 秒未回复）`)
+        return false
+      }
+      const text = extractTextFromMessage(answer)
+      const ok = isConfirmInput(text)
+      logInfo(`开画前确认：用户回复 ${JSON.stringify(text)} -> ${ok ? '开始画' : '视为取消'}`)
+      return ok
     }
 
     /** 从消息中提取纯文本 */

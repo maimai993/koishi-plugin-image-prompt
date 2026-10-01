@@ -63,10 +63,11 @@ const imageCount = (call) => {
 /**
  * 跑一次命令。
  * @param {string[]} scripted 选图接口依次返回的模型回复
- * @param {{userText?: string, promptReturn?: string, selector?: object}} [options]
+ * @param {{userText?: string, promptReturn?: string, selector?: object, top?: object}} [options]
  *   userText     用户随指令附带的需求（默认「白发少女」）
- *   promptReturn session.prompt() 的返回值（用来模拟用户在追问后补发图片）
+ *   promptReturn session.prompt() 的返回值（用来模拟用户补图 / 回复「确认」）
  *   selector     aiSelector 配置覆盖
+ *   top          顶层配置覆盖（backgroundDrawing / confirmBeforeDraw / confirmTimeout …）
  */
 async function run(scripted, options = {}) {
   const calls = []
@@ -105,6 +106,8 @@ async function run(scripted, options = {}) {
     // maxRetries 不填会得到 undefined，循环一次都不进、请求根本不发。
     maxRetries: 0,
     retryInterval: 1,
+    // 下面几段都在测「不需要确认」的主链路，确认流程单独放在最后两段
+    confirmBeforeDraw: false,
     referenceGroups: [
       {
         name: '角色立绘',
@@ -133,6 +136,8 @@ async function run(scripted, options = {}) {
     },
     resultGallery: { enabled: false },
     backgroundDrawing: { enabled: false },
+    // 顶层配置覆盖（backgroundDrawing / confirmBeforeDraw / confirmTimeout …）
+    ...(options.top || {}),
     nested: {
       commands: [
         {
@@ -191,6 +196,8 @@ async function run(scripted, options = {}) {
     result = '（action 抛错）' + error.message
     if (process.env.DEBUG_E2E) console.log('    [debug] 堆栈:\n' + String(error.stack).split('\n').slice(0, 8).join('\n'))
   }
+  // 后台绘图是 fire-and-forget，给它一点时间跑完，免得断言前进程就退出了
+  if (options.top?.backgroundDrawing?.enabled) await new Promise(resolve => setTimeout(resolve, 80))
   await ctx.stop()
 
   const selectorCalls = calls.filter(c => c.url === SELECTOR_URL)
@@ -257,6 +264,15 @@ async function main() {
       assert.strictEqual(r.drawCalls.length, 1, '应该发起 1 次绘图请求')
       assert.strictEqual(imageCount(r.drawCalls[0]), 1, `绘图参考图应只有 1 张`)
     })
+    check('★ 指令一触发就先发了「收到」提示（不让用户干等）', () => {
+      const allText = allTextOf(r)
+      assert.ok(allText.includes('image-prompt.messages.ack'), `应该先回一条收到提示，实际: ${allText.slice(0, 200)}`)
+    })
+    check('★ 提示词只回显一次（后台不后台都一样，不能重复发）', () => {
+      const allText = allTextOf(r)
+      const times = allText.split('draw the character on a desk').length - 1
+      assert.strictEqual(times, 1, `提示词出现了 ${times} 次，应该只有 1 次`)
+    })
   }
 
   console.log('2) 打分制：全部不达标 -> 不该硬凑')
@@ -321,6 +337,71 @@ async function main() {
       assert.strictEqual(r.drawCalls.length, 1, '应该发起 1 次绘图请求')
       assert.strictEqual(imageCount(r.drawCalls[0]), 1, '参考图应只有用户补发的那张')
     })
+  }
+
+  console.log('5) 开了后台绘图 -> 提示与提示词各只发一次（不重复）')
+  {
+    const scores = JSON.stringify({ scores: [{ index: 1, score: 92, why: '命中' }, { index: 2, score: 0, why: '-' }, { index: 3, score: 0, why: '-' }] })
+    const r = await run([ANALYSIS, scores], { top: { backgroundDrawing: { enabled: true } } })
+    if (process.env.DEBUG_E2E) console.log('    [debug] 消息条数:', r.sent.length, JSON.stringify(r.sent).slice(0, 600))
+    check('★ 提示词只出现 1 次', () => {
+      const times = allTextOf(r).split('draw the character on a desk').length - 1
+      assert.strictEqual(times, 1, `提示词出现了 ${times} 次，应该只有 1 次`)
+    })
+    check('★ 选图结果说明只出现 1 次', () => {
+      const times = allTextOf(r).split('image-prompt.messages.selected').length - 1
+      assert.strictEqual(times, 1, `选图结果出现了 ${times} 次，应该只有 1 次`)
+    })
+    check('后台绘图提示仍在（不能把该说的也一起删掉）', () => {
+      assert.ok(allTextOf(r).includes('image-prompt.messages.bgstart'), '应提示已开始后台绘图')
+    })
+  }
+
+  console.log('6) 开画前确认：回复「确认」才画（同时开着后台绘图）')
+  {
+    const scores = JSON.stringify({ scores: [{ index: 1, score: 92, why: '命中' }, { index: 2, score: 0, why: '-' }, { index: 3, score: 0, why: '-' }] })
+    const r = await run([ANALYSIS, scores], {
+      top: { confirmBeforeDraw: true, confirmTimeout: 5, backgroundDrawing: { enabled: true } },
+      promptReturn: '确认',
+    })
+    check('★ 确认消息里列出了本次要参考的图', () => {
+      const allText = allTextOf(r)
+      assert.ok(allText.includes('confirmask'), '应该先发确认请求')
+      assert.ok(allText.includes('白发少女 双马尾'), `应列出参考图描述，实际: ${allText.slice(0, 400)}`)
+    })
+    check('★ 回复「确认」之后才真的发起绘图', () => {
+      assert.strictEqual(r.drawCalls.length, 1, `应该发起 1 次绘图请求，实际 ${r.drawCalls.length}`)
+      assert.strictEqual(imageCount(r.drawCalls[0]), 1)
+    })
+    check('★ 确认 + 后台绘图：提示词仍然只出现 1 次', () => {
+      const times = allTextOf(r).split('draw the character on a desk').length - 1
+      assert.strictEqual(times, 1, `提示词出现了 ${times} 次`)
+    })
+  }
+
+  console.log('7) 开画前确认：不确认就不画')
+  {
+    const scores = JSON.stringify({ scores: [{ index: 1, score: 92, why: '命中' }, { index: 2, score: 0, why: '-' }, { index: 3, score: 0, why: '-' }] })
+    const r = await run([ANALYSIS, scores], {
+      top: { confirmBeforeDraw: true, confirmTimeout: 5 },
+      promptReturn: '算了，我再想想',
+    })
+    check('★ 没确认 -> 一张都不画（不浪费额度）', () =>
+      assert.strictEqual(r.drawCalls.length, 0, `不该发起绘图，实际 ${r.drawCalls.length} 次`))
+    check('★ 明确告诉用户已取消', () => {
+      assert.ok(allTextOf(r).includes('confirmcancel'), `应提示已取消，实际: ${allTextOf(r).slice(0, 300)}`)
+    })
+  }
+
+  console.log('8) 开画前确认：超时没回也算取消')
+  {
+    const scores = JSON.stringify({ scores: [{ index: 1, score: 92, why: '命中' }, { index: 2, score: 0, why: '-' }, { index: 3, score: 0, why: '-' }] })
+    const r = await run([ANALYSIS, scores], {
+      top: { confirmBeforeDraw: true, confirmTimeout: 5 },
+      promptReturn: undefined,
+    })
+    check('★ 超时 -> 不画', () => assert.strictEqual(r.drawCalls.length, 0))
+    check('★ 超时也回一条取消提示', () => assert.ok(allTextOf(r).includes('confirmcancel')))
   }
 
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`)

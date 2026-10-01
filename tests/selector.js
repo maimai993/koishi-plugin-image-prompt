@@ -18,6 +18,9 @@ const {
   selectByScore,
   dedupeCandidates,
   extractJsonObject,
+  sanitizeAskMessage,
+  isConfirmInput,
+  buildSelectorContent,
 } = require('../lib/index.js')
 
 let pass = 0
@@ -175,6 +178,68 @@ check('extractJsonObject 取第一个对象', () => {
   assert.deepStrictEqual(extractJsonObject('前言 {"a":1} 后记'), { a: 1 })
   assert.deepStrictEqual(extractJsonObject('```json\n{"a":1}\n```'), { a: 1 })
   assert.strictEqual(extractJsonObject('没有对象'), null)
+})
+
+// ---------- 9. 追问文案清洗 ----------
+// 实测模型会输出「能发一张…参考图吗？顺便说说 DeepSeek 画成鲸鱼可以吗？」这种
+check('★ 只保留第一句，砍掉后面瞎聊的', () => {
+  const raw = '能发一张你想用的自己形象的参考图吗？顺便说说DeepSeek画成鲸鱼可以吗？'
+  const out = sanitizeAskMessage(raw)
+  assert.strictEqual(out, '能发一张你想用的自己形象的参考图吗？')
+  assert.ok(!out.includes('DeepSeek'), '不该把模型名带进来')
+})
+check('正常的一句话原样保留', () => {
+  assert.strictEqual(sanitizeAskMessage('能发一张白发水手服的立绘吗？'), '能发一张白发水手服的立绘吗？')
+})
+check('去掉换行、markdown 与包裹引号', () => {
+  assert.strictEqual(sanitizeAskMessage('「能发一张立绘吗？」'), '能发一张立绘吗？')
+  assert.strictEqual(sanitizeAskMessage('- 发张图\n'), '发张图')
+})
+check('超长截断', () => {
+  const out = sanitizeAskMessage('一'.repeat(80) + '，后面还有很多话')
+  assert.ok(out.length <= 41, `实际长度 ${out.length}`)
+  assert.ok(out.endsWith('…'))
+})
+check('空值返回空串', () => {
+  assert.strictEqual(sanitizeAskMessage(''), '')
+  assert.strictEqual(sanitizeAskMessage(null), '')
+  assert.strictEqual(sanitizeAskMessage(undefined), '')
+})
+check('parseAnalysisResult 出来的 needTypes 已经洗过', () => {
+  const a = parseAnalysisResult(JSON.stringify({ needTypes: '发张图吧。顺便聊聊天气' }))
+  assert.strictEqual(a.needTypes, '发张图吧。')
+})
+
+// ---------- 10. 开画前确认的回复判定 ----------
+check('★ 认这些确认词', () => {
+  for (const s of ['确认', '确定', 'ok', 'OK', '好的', '可以', '开始', '画吧', 'yes', '1', '确认！', ' 确认 ']) {
+    assert.ok(isConfirmInput(s), `${s} 应该算确认`)
+  }
+})
+check('★ 聊天/否定不算确认', () => {
+  for (const s of ['算了', '不确定', '不要', '等等', '确认，另外把头发画长一点', '', '?', '我再想想', 'no']) {
+    assert.ok(!isConfirmInput(s), `${s} 不该算确认`)
+  }
+  assert.ok(!isConfirmInput(undefined))
+})
+
+// ---------- 11. 识图模式：图片内联 ----------
+const V = [C('g', 'https://a/1.png', '甲'), C('g', 'https://a/2.png', '乙')]
+check('没传 dataUrls 时退回原始链接（保持老行为）', () => {
+  const parts = buildSelectorContent('正文', V, true, 6)
+  const urls = parts.filter(p => p.type === 'image_url').map(p => p.image_url.url)
+  assert.deepStrictEqual(urls, ['https://a/1.png', 'https://a/2.png'])
+})
+check('★ 传了 dataUrls 就只发内联的，下载失败的不再发原链接', () => {
+  const parts = buildSelectorContent('正文', V, true, 6, ['data:image/png;base64,AAA', undefined])
+  const urls = parts.filter(p => p.type === 'image_url').map(p => p.image_url.url)
+  assert.deepStrictEqual(urls, ['data:image/png;base64,AAA'])
+  // 文字描述必须都还在，模型还能靠描述判断
+  const texts = parts.filter(p => p.type === 'text').map(p => p.text).join('\n')
+  assert.ok(texts.includes('甲') && texts.includes('乙'))
+})
+check('关掉识图就是纯文本', () => {
+  assert.strictEqual(buildSelectorContent('正文', V, false, 6), '正文')
 })
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
