@@ -28,18 +28,25 @@ export const usage = `
 【AI 选择参考图片】
 
 1. 在「参考图片组」中注册分组：每组填写若干张「图片链接 + 描述」（描述用于让 AI 判断该图的用途）。
+   **描述一定要写具体**（发色发型、服装、动作、画风）—— 打分制下没描述的图永远选不上。
 2. 在指令配置的「引用的参考图片组名称」中填入组名（可填多个），该指令执行时会把组内图片全部交给 AI 挑选。
-3. 「AI 选图设置」可修改对话模型（默认 Qwen/Qwen2.5-7B-Instruct）、选择提示词模板、超时与重试等；
+3. 「AI 选图设置」可修改对话模型（默认 Qwen/Qwen2.5-7B-Instruct）、选择模式、提示词模板、超时与重试等；
    接口地址/密钥留空时复用绘图接口的配置。
-4. 当 AI 判定候选图片里没有合适的参考图时，会按配置询问用户补充发送图片（用户发送后会被直接使用）。
+4. 「选图模式」默认是**打分制**：先只做需求分析（**不给模型候选图**，它没有「可挑的对象」），
+   再用关键词在本地召回，然后要求模型给每张候选图打 0-100 分，低于「最低分数线」的一律不要。
+   一张都不达标就如实告知用户「图库里没有合适的参考图」，**不会硬凑**；
+   若开启「缺少合适参考图时询问用户补充发送」，会请用户补发一张参考图（用户发的图会被直接使用）。
+   想回到老行为就把「选图模式」改成「旧版」。
+5. 当用户明确说「不用参考 / 随意画 / 自由发挥」时，直接跳过选图，一次选图请求都不发。
+6. 「启用 AI 智能选择参考图片」默认关闭，需手动开启；「AI 选图失败时回退为使用候选池内全部图片」默认关闭，
+   失败时本次不使用参考图片（开启则改用候选池内全部图片）。注意「回退」只对**请求失败**生效，
+   对「打分不达标」不生效 —— 后者就该不带参考图。
+7. 「旧版」模式下参考图较多时（超过 12 张）自动走两级检索：先让模型产出检索关键词、本地匹配召回，
+   再对召回结果精排；识图模式下也只发送召回的这几张图片，避免每次都把整个图库发给模型。
+8. 描述可以用「生成描述」指令让模型看图自动生成并写回配置（需要支持图片输入的模型）。
    若选图模型支持识别图片（多模态），可勾选「选图模型支持识别图片」，插件会把候选图片本身发给模型，
    模型对着真实图片挑选；它给出的关键视觉特征还会并入绘图提示词，让出图更还原参考图。
-5. 「启用 AI 智能选择参考图片」默认关闭，需手动开启；「AI 选图失败时回退为使用候选池内全部图片」默认关闭，
-   失败时本次不使用参考图片（开启则改用候选池内全部图片）。
-6. 参考图较多时（超过 12 张）自动走两级检索：先让模型产出检索关键词、本地匹配召回，再对召回结果精排；
-   识图模式下也只发送召回的这几张图片，避免每次都把整个图库发给模型。
-7. 描述可以用「生成描述」指令让模型看图自动生成并写回配置（需要支持图片输入的模型）。
-8. 生成结果可自动入库（默认关闭），下次能被自己检索到并复用，形成闭环；
+9. 生成结果可自动入库（默认关闭），下次能被自己检索到并复用，形成闭环；
    开启「后台绘图」后出图不再阻塞，先回「正在画」，画好主动推送。
 
 提示词模板可用占位符：{candidates} 候选图片列表、{userInput} 用户附加需求、{max} 最多选择数量、{command} 指令名、{prompt} 指令提示词
@@ -201,6 +208,203 @@ export function mergeCandidates(...lists: CandidateImage[][]): CandidateImage[] 
     }
   }
   return result
+}
+
+// ============================================================================
+// AI 选图：需求抽取 → 关键词召回 → 逐图打分 → 阈值兜底
+// 思路来自 NeoBot 的「先检索再引用」：模型不直接面对一堆候选去「挑」，
+// 而是先把「要什么」想清楚，再对召回的少数图逐张显式打分；
+// 分数不达标就如实回「图库没有合适的图」，而不是硬挑一张凑数。
+// ============================================================================
+
+/** 选图第一步的产物：先想清楚「要什么」，再去看「有什么」 */
+export interface RequirementAnalysis {
+  /** 画面主体（一句话） */
+  subject: string
+  /** 硬性要素：缺一个就不该选这张图 */
+  must: string[]
+  /** 加分要素：有更好，没有也能用 */
+  nice: string[]
+  /** 明确不要出现的 */
+  avoid: string[]
+  /** 画面需要出现的文字（台词/标题/招牌），交给浏览器渲染 */
+  text: string
+  /** 用户表示「不用参考/随意画」时跳过检索 */
+  skipReference: boolean
+  /** 判定需要用户补图时，用一句话说明要什么样的图 */
+  needTypes: string
+}
+
+/** 单张候选图的打分结果（index 从 1 开始，对应候选列表位置） */
+export interface ScoredCandidate {
+  index: number
+  score: number
+  why: string
+}
+
+/** 用户明确表示不需要参考图（回退到纯文生图） */
+const SKIP_REFERENCE_RE = new RegExp([
+  '(不用|不需要|无需|不要|别)(参考|垫图|看图|找图|搜图|调图库)',
+  '(参考图|垫图|图库)(不用|不需要|就别|去掉)',
+  '(随意|随便|自由|任意)发挥',
+  '随意画|随便画|你看着画|看着办|你决定',
+].join('|'))
+
+/** 从任意文本里挖出第一个 JSON 对象（容忍代码块围栏和前后废话） */
+export function extractJsonObject(raw: string | null | undefined): any | null {
+  if (!raw) return null
+  let text = String(raw).trim()
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (fence) text = fence[1].trim()
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start === -1 || end <= start) return null
+  try {
+    const value = JSON.parse(text.slice(start, end + 1))
+    return value && typeof value === 'object' ? value : null
+  } catch {
+    return null
+  }
+}
+
+/** 把模型给的字段统一成字符串数组（支持数组 / 逗号顿号换行分隔的字符串） */
+export function toStrList(value: any): string[] {
+  if (Array.isArray(value)) return value.map(v => String(v ?? '').trim()).filter(Boolean)
+  if (typeof value === 'string' && value.trim()) {
+    return value.split(/[,，、;；\n]+/).map(s => s.trim()).filter(Boolean)
+  }
+  return []
+}
+
+/** 用户这句话是不是「不用参考了」 */
+export function isSkipReferenceInput(userInput: string): boolean {
+  const text = String(userInput || '').trim()
+  if (!text) return false
+  return SKIP_REFERENCE_RE.test(text)
+}
+
+/** 解析「需求抽取」的返回 */
+export function parseAnalysisResult(raw: string | null): RequirementAnalysis | null {
+  const data = extractJsonObject(raw)
+  if (!data) return null
+  const text = data.text ?? data.texts ?? data.lines ?? data.renderText
+  return {
+    subject: String(data.subject ?? data.主体 ?? '').trim(),
+    must: toStrList(data.must ?? data.mustHave ?? data.required ?? data.硬性要素),
+    nice: toStrList(data.nice ?? data.niceToHave ?? data.optional ?? data.加分要素),
+    avoid: toStrList(data.avoid ?? data.exclude ?? data.negative ?? data.不要出现),
+    text: Array.isArray(text) ? toStrList(text).join('\n') : String(text ?? '').trim(),
+    skipReference: data.skipReference === true || data.skip_reference === true,
+    needTypes: String(data.needTypes ?? data.need_types ?? data.需要的图 ?? '').trim(),
+  }
+}
+
+/** 把「需求要素」转成本地检索用的关键词 */
+export function keywordsFromAnalysis(analysis: RequirementAnalysis | null): string[] {
+  if (!analysis) return []
+  const words: string[] = []
+  const push = (value: string) => {
+    const item = String(value || '').trim()
+    if (item && !words.includes(item)) words.push(item)
+  }
+  if (analysis.subject) push(analysis.subject)
+  analysis.must.forEach(push)
+  analysis.nice.forEach(push)
+  return words
+}
+
+/** 把分数归一化到 0-100（兼容 0.85 这种小数写法、以及 "85分" 这种字符串） */
+export function normalizeScore(value: any): number | null {
+  if (typeof value === 'number' && isFinite(value)) {
+    const num = value > 0 && value <= 1 ? Math.round(value * 100) : Math.round(value)
+    return Math.max(0, Math.min(100, num))
+  }
+  if (typeof value === 'string') {
+    const matched = value.match(/-?\d+(?:\.\d+)?/)
+    if (!matched) return null
+    return normalizeScore(parseFloat(matched[0]))
+  }
+  return null
+}
+
+/** 解析「逐图打分」的返回 */
+export function parseScoreResult(raw: string | null, candidates: CandidateImage[]): ScoredCandidate[] {
+  const data = extractJsonObject(raw)
+  if (!data) return []
+  const list = data.scores ?? data.score ?? data.items ?? data.results ?? data.评分
+  if (!Array.isArray(list)) return []
+
+  const out: ScoredCandidate[] = []
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object') continue
+    const rawIndex = entry.index ?? entry.id ?? entry.no ?? entry.n ?? entry.编号
+    const index = rawIndex === undefined ? null : parseInt(String(rawIndex).replace(/[^0-9-]/g, ''), 10)
+    const score = normalizeScore(entry.score ?? entry.points ?? entry.分数 ?? entry.value)
+    if (index === null || isNaN(index) || score === null) continue
+    // 兼容 0-based 写法，统一换算成从 1 开始
+    const candidate = candidates[index - 1] || candidates[index]
+    if (!candidate) continue
+    out.push({ index: candidates.indexOf(candidate) + 1, score, why: String(entry.why ?? entry.reason ?? entry.说明 ?? '').trim() })
+  }
+  return out
+}
+
+/**
+ * 按分数阈值筛选：只有达到 minScore 的才留下，按分数从高到低取前 max 张。
+ * 一张都不达标时返回空数组 —— 这是「宁可不选也不乱选」的兜底。
+ */
+export function selectByScore(
+  scored: ScoredCandidate[],
+  candidates: CandidateImage[],
+  minScore: number,
+  max: number
+): { picked: CandidateImage[], best: number, passed: number } {
+  const threshold = minScore > 0 ? minScore : 0
+  // 同一张图若被打了多次分，取最高的一次
+  const best = new Map<number, ScoredCandidate>()
+  for (const item of scored || []) {
+    const prev = best.get(item.index)
+    if (!prev || item.score > prev.score) best.set(item.index, item)
+  }
+
+  const eligible = [...best.values()]
+    .filter(item => item.score >= threshold)
+    .sort((a, b) => b.score - a.score)
+
+  const limit = max > 0 ? max : 1
+  const picked: CandidateImage[] = []
+  for (const item of eligible) {
+    if (picked.length >= limit) break
+    const candidate = candidates[item.index - 1]
+    if (candidate && !picked.includes(candidate)) picked.push(candidate)
+  }
+
+  return {
+    picked,
+    best: (scored || []).reduce((acc, item) => Math.max(acc, item.score), 0),
+    passed: eligible.length,
+  }
+}
+
+/**
+ * 去掉重复图：链接相同的直接去掉；描述完全相同的（同一批入库的近似图）只留第一张。
+ */
+export function dedupeCandidates(list: CandidateImage[]): CandidateImage[] {
+  const out: CandidateImage[] = []
+  const seenUrl = new Set<string>()
+  const seenDesc = new Set<string>()
+  for (const item of list || []) {
+    if (!item || !item.url || seenUrl.has(item.url)) continue
+    const desc = normalizeText(item.description || '')
+    // 描述太短（如「无描述」）不参与描述去重，避免误杀
+    if (desc.length >= 6) {
+      if (seenDesc.has(desc)) continue
+      seenDesc.add(desc)
+    }
+    seenUrl.add(item.url)
+    out.push(item)
+  }
+  return out
 }
 
 /**
@@ -970,6 +1174,18 @@ interface AISelectorConfig {
   maxTokensCeiling?: number
   /** 诊断指令名：发一次选图请求并回显模型原始返回 */
   debugCommand?: string
+  /** 选图模式：score = 抽需求+逐图打分（默认）；legacy = 旧的候选全量丢给模型挑 */
+  selectionMode?: 'score' | 'legacy'
+  /** 打分制的最低分数线（0-100），低于它的图一律不选 */
+  minScore?: number
+  /** 打分制第一步「需求分析」的提示词模板 */
+  analyzePrompt?: string
+  /** 打分制第二步「逐图打分」的提示词模板 */
+  scorePrompt?: string
+  /** 是否合并描述完全相同的重复参考图（默认开） */
+  dedupe?: boolean
+  /** 用户说「不用参考/随意画」时是否跳过选图（默认开） */
+  respectSkipReference?: boolean
 }
 
 /** 交给 AI 挑选的候选图片 */
@@ -1062,6 +1278,60 @@ const DEFAULT_KEYWORD_PROMPT = `你是一个参考图片检索助手。用户要
 
 只输出一个 JSON 对象，不要输出解释或代码块：
 {"keywords":["关键词1","关键词2"],"candidates":[1,3]}`
+
+/** 第一步：只做需求分析，不给候选图 —— 模型没有「挑」的机会，从根上避免乱选 */
+const DEFAULT_ANALYZE_PROMPT = `你是绘图参考图的「需求分析助手」。**这一步只做分析，不要挑选任何图片。**
+
+绘图指令：{command}
+该指令的用途提示词：{prompt}
+用户本次的需求：{userInput}
+
+请先把「这次画面上必须有 / 最好有的视觉要素」想清楚，再输出 JSON。
+
+规则：
+1. must（硬性要素）：缺一个就不该选这张参考图。只写**能从图片上看出来的**视觉特征，
+   例如角色名、发色发型、瞳色、服装款式、配饰、物种、画风。不要写抽象词（如「好看」「高级」）。
+   指令用途提示词里本来就固定的风格（比如「1/7 手办」「透明亚克力底座」）不要写进 must。
+2. nice（加分要素）：有更好、没有也能用，例如动作、表情、构图、场景、氛围。
+3. avoid：明确不要出现的东西（用户说「不要 XX」「换成 YY」时，把被否掉的那个写这里）。
+4. subject：这次画面的主体，一句话（如「白发的少女」）。
+5. text：画面上需要出现的文字（台词/标题/招牌/字幕），多行用 \\n 换行；不需要就空字符串。
+6. skipReference：用户明确表示「不用参考 / 随意画 / 自由发挥 / 你看着办」时为 true。
+7. needTypes：图库里**没有**合适参考图时，插件要请用户补发一张。这里写一句**直接对用户说**的话
+   （中文，40 字以内，语气自然，不要用「请提供图片」这种套话），例如「能发一张白发水手服的立绘吗？」。
+   图库里不缺图就留空字符串。
+
+只输出一个 JSON 对象，不要解释、不要 Markdown 代码块：
+{"subject":"","must":[],"nice":[],"avoid":[],"text":"","skipReference":false,"needTypes":""}`
+
+/** 第二步：逐图显式打分 —— 强制给每张打分 + 硬性要素缺失即判低分，杜绝"硬凑数" */
+const DEFAULT_SCORE_PROMPT = `你是绘图参考图的「打分助手」。下面是已经分析好的需求，以及若干候选参考图。
+**你的任务是给每一张候选图打分，而不是挑出「最像的」来凑数。**
+
+本次需求：
+主体：{subject}
+硬性要素（缺一个就不合格）：{must}
+加分要素：{nice}
+不要出现：{avoid}
+
+候选参考图（编号 | 所属组 | 描述）：
+{candidates}
+
+打分规则：
+1. **必须给每一张候选图都打一个 0-100 的分数**，一张都不能漏。
+2. 打分只看「这张图能不能当本次绘图的参考」：
+   - 硬性要素命中得越多分越高；**硬性要素缺失或与需求矛盾 → 只能给 0-30 分**。
+   - 描述为空、看不懂内容、无法判断的图 → **一律给 0 分**，不要靠猜。
+   - 与 avoid 冲突的 → 0 分。
+   - 命中加分要素、或组名/描述与需求高度吻合 → 可以给 80-100。
+3. **宁可漏选，不可乱选。** 拿不准就打低分。给不相关的图打高分是最严重的错误。
+4. 如果所有候选都不合适，就照实全部打低分，**不要为了凑数抬高分数**。
+5. why 用不超过 15 个字说明理由，例如「命中白发+水手服」「描述为空无法判断」。
+6. hint（可选）：**只有在你实际看到了图片时**才填 —— 用一句话概括选中图片里决定外观的关键视觉特征
+   （发色发型/瞳色/服装/配饰/画风），便于并入绘图提示词；只给了文字描述就留空字符串。
+
+只输出一个 JSON 对象，不要解释、不要 Markdown 代码块：
+{"scores":[{"index":1,"score":85,"why":"命中白发双马尾"},{"index":2,"score":0,"why":"描述为空"}],"hint":""}`
 
 const defaultCommands: any[] = [
   {
@@ -1571,6 +1841,13 @@ export const Config: Schema = Schema.intersect([
   Schema.object({
     aiSelector: Schema.object({
       enabled: Schema.boolean().default(false).description('启用 AI 智能选择参考图片（默认关闭，需要时手动开启）'),
+      selectionMode: Schema.union([
+        Schema.const('score').description('打分制（推荐）：先分析需求 → 关键词召回 → 逐图打分 → 分数不够就如实说「没有合适的图」'),
+        Schema.const('legacy').description('旧版：把候选图全部丢给模型一次挑完（容易硬凑数，仅在需要兼容时使用）'),
+      ]).default('score').description('选图模式。打分制会给模型留退路，不会在没有合适图时硬挑一张'),
+      minScore: Schema.number().default(60).min(0).max(100).step(5).description('打分制的最低分数线（0-100）。低于该分数的参考图一律不选；全部不达标就判定「图库没有合适的图」并询问用户补图'),
+      dedupe: Schema.boolean().default(true).description('合并重复参考图（链接相同，或描述完全相同的近似图只保留一张）'),
+      respectSkipReference: Schema.boolean().default(true).description('用户说「不用参考 / 随意画 / 自由发挥」时跳过选图，一次选图请求都不发（需求分析也省掉）'),
       baseUrl: Schema.string().role('link').description('AI 选图接口地址（OpenAI 兼容 Chat Completions，留空则复用绘图接口地址）'),
       apiKey: Schema.string().role('secret').description('AI 选图接口密钥（留空则复用绘图 API 密钥）'),
       model: Schema.string().default('Qwen/Qwen2.5-7B-Instruct').description('用于选择参考图片的对话模型'),
@@ -1591,10 +1868,12 @@ export const Config: Schema = Schema.intersect([
       visionMaxImages: Schema.number().default(6).min(1).max(20).step(1).description('开启识别图片时，最多附带多少张候选图片（超出部分只发文字描述，避免请求过大）'),
       visionFallback: Schema.boolean().default(true).description('带图片请求失败时，自动退回纯文字再试一次'),
       appendHint: Schema.boolean().default(true).description('把模型看图后给出的关键视觉特征并入绘图提示词（仅在开启识别图片时生效，让出图更还原参考图）'),
-      twoStage: Schema.boolean().default(true).description('两级检索选图：先让模型产出检索关键词并在本地召回，再对召回结果精排。参考图很多时强烈建议开启'),
+      twoStage: Schema.boolean().default(true).description('【仅旧版模式生效】两级检索选图：先让模型产出检索关键词并在本地召回，再对召回结果精排。打分制已内置召回，无需此项'),
       twoStageThreshold: Schema.number().default(12).min(2).max(200).step(1).description('候选图片超过多少张才启用两级检索（少于此值直接一次问完，更省事）'),
       retrievalTopK: Schema.number().default(12).min(1).max(50).step(1).description('第一级召回的候选数量上限（精排只看这么多张）'),
       keywordPrompt: Schema.string().role('textarea', { rows: [10, 6] }).default(DEFAULT_KEYWORD_PROMPT).description('检索提示词模板，可用占位符：{index} 图片索引、{userInput} 用户附加需求、{command} 指令名、{prompt} 指令提示词、{topK} 召回上限'),
+      analyzePrompt: Schema.string().role('textarea', { rows: [12, 6] }).default(DEFAULT_ANALYZE_PROMPT).description('（打分制第一步）需求分析提示词，可用占位符：{command} 指令名、{prompt} 指令提示词、{userInput} 用户附加需求。这一步**不把候选图给模型**，所以模型没有乱选的机会'),
+      scorePrompt: Schema.string().role('textarea', { rows: [12, 6] }).default(DEFAULT_SCORE_PROMPT).description('（打分制第二步）逐图打分提示词，可用占位符：{subject} 主体、{must} 硬性要素、{nice} 加分要素、{avoid} 不要出现、{candidates} 候选图片列表、{max} 最多选择数量'),
       captionCommand: Schema.string().default('生成描述').description('自动生成描述的指令名（挂在指令根下；直接发图则只识别并返回描述）'),
       captionModel: Schema.string().description('生成描述用的模型（留空则用上面的选图模型；必须是支持图片输入的模型）'),
       captionPrompt: Schema.string().role('textarea', { rows: [8, 4] }).default(DEFAULT_CAPTION_PROMPT).description('生成描述的提示词（要求模型写出便于检索的关键词）'),
@@ -1843,10 +2122,11 @@ export function apply(ctx: Context, config: CommandConfig) {
           selecting: '正在智能挑选参考图片...',
           selectfailed: 'AI 选图失败（{0}），已改用全部候选参考图片',
           selectfailedNoFallback: 'AI 选图失败（{0}），本次不使用参考图片',
+          nomatch: '图库里没有合适的参考图：{0}',
           selected: '已为你挑选参考图片：\n{0}',
           askimage: '{0}\n请在{1}秒内发送图片...',
           askimageDefault: '候选参考图片里没有合适的图片，需要你补充一张参考图',
-          noask: '未收到补充图片，将使用现有图片继续处理',
+          noask: '未收到补充图片，继续处理',
           gotimage: '已收到补充图片，继续处理...',
           recalled: '（参考图检索：{0} 张中命中 {1} 张候选）',
           hintsingle: '参考图关键特征（务必还原）：{0}',
@@ -2065,16 +2345,25 @@ export function apply(ctx: Context, config: CommandConfig) {
                   aiRenderText = selection.renderText
                   logInfo(`选图模型给出需要渲染的文字: ${aiRenderText.replace(/\n/g, ' / ')}`)
                 }
-              } else if (!selection.ok || selection.picked.length === 0) {
-                if (!selection.ok) {
-                  ctx.logger.warn(`[${cmdConfig.name}] AI 选图失败，fallbackOnError=${selector.fallbackOnError}`)
+              } else if (selection.ok && selection.picked.length === 0) {
+                // 打分制判定「图库确实没有合适的图」：如实告诉用户，**不**回退成
+                // 「把候选全塞进去」—— 那正是以前「乱选参考图」的根源。
+                // 说明文字留在 selectionNote 里，后面无论是询问用户补图、
+                // 还是最终因为一张图都没有而中止，用户都能看到原因。
+                logInfo(`[${cmdConfig.name}] 没有参考图达到阈值：${selection.reason}`)
+                if (selector.notify) {
+                  selectionNote = '\n' + session.text('image-prompt.messages.nomatch', [
+                    selection.reason || '无匹配',
+                  ])
                 }
+              } else if (!selection.ok) {
+                ctx.logger.warn(`[${cmdConfig.name}] AI 选图失败，fallbackOnError=${selector.fallbackOnError}`)
                 if (selector.fallbackOnError) {
                   images.push(...candidates.map(c => c.url))
                   aiProvidedImages += candidates.length
                 }
                 // 无论是否回退，都告知用户选图未生效及原因
-                if (selector.notify && !selection.ok) {
+                if (selector.notify) {
                   selectionNote = '\n' + session.text(
                     selector.fallbackOnError
                       ? 'image-prompt.messages.selectfailed'
@@ -2162,7 +2451,9 @@ export function apply(ctx: Context, config: CommandConfig) {
 
           // 检查是否有图片（文字参考图也算一张图）
           if (images.length === 0 && !textRef) {
-            await reply(session, [session.text("image-prompt.messages.needimages")])
+            // 带上选图说明：图库里没有匹配时不至于只丢一句「请提供至少一张图片」，
+            // 用户能马上知道是「图库没匹配上」还是「自己忘了发图」。
+            await reply(session, [session.text("image-prompt.messages.needimages") + selectionNote])
             return
           }
 
@@ -2785,7 +3076,14 @@ export function apply(ctx: Context, config: CommandConfig) {
     }
 
     /**
-     * 选图入口：候选少时一次问完，候选多时走两级检索（关键词召回 → 精排）
+     * 选图入口。
+     *
+     * 默认走「打分制」（selectionMode = 'score'）：
+     *   需求分析（不给候选）→ 关键词召回 → 逐图显式打分 → 分数够不到阈值就不要
+     * 这套流程的要点是**给模型留退路**：候选项不达标时它可以一张都不选，
+     * 而不是像以前那样被逼着从一堆图里挑一张出来凑数。
+     *
+     * 传 selectionMode = 'legacy' 可回到旧的「候选全量丢给模型挑」逻辑。
      */
     async function runAISelection(
       candidates: CandidateImage[],
@@ -2795,8 +3093,12 @@ export function apply(ctx: Context, config: CommandConfig) {
       max: number
     ): Promise<SelectionResult> {
       const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
-      const threshold = selector.twoStageThreshold || 12
 
+      if (selector.selectionMode !== 'legacy') {
+        return runScoredSelection(candidates, userInput, cmdConfig, promptText, max)
+      }
+
+      const threshold = selector.twoStageThreshold || 12
       if (selector.twoStage !== false && candidates.length > threshold) {
         const result = await runTwoStageSelection(candidates, userInput, cmdConfig, promptText, max)
         // 两级检索没召回任何东西（关键词没命中）时，退回单阶段全量问一次
@@ -2805,6 +3107,133 @@ export function apply(ctx: Context, config: CommandConfig) {
       }
 
       return runSingleStageSelection(candidates, userInput, cmdConfig, promptText, max)
+    }
+
+    /**
+     * 打分制选图（默认）：
+     *
+     * 1. 需求分析 —— 只给指令和用户需求，**不给任何候选图**。
+     *    模型没有「可挑的对象」，自然不可能乱选，只会老实说清「这次要什么」。
+     * 2. 本地召回 —— 拿分析出的硬性/加分要素做关键词匹配，把候选池缩到十几张。
+     * 3. 逐图打分 —— 要求模型给**每一张**打 0-100 分，并强制「硬性要素缺失就给低分、
+     *    描述为空一律 0 分、拿不准就打低分」。
+     * 4. 阈值兜底 —— 达不到 minScore 的一律丢弃；一张都不够就如实回「没有合适的图」，
+     *    交给上层去问用户补图，而不是硬塞一张不相关的图进参考。
+     */
+    async function runScoredSelection(
+      candidates: CandidateImage[],
+      userInput: string,
+      cmdConfig: CommandConfig['nested']['commands'][number],
+      promptText: string,
+      max: number
+    ): Promise<SelectionResult> {
+      const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
+      const minScore = typeof selector.minScore === 'number' ? selector.minScore : 60
+      const topK = selector.retrievalTopK || 12
+      const respectSkip = selector.respectSkipReference !== false
+
+      // ---- 0. 用户明说「不用参考」就省掉请求 ----
+      if (respectSkip && isSkipReferenceInput(userInput)) {
+        logInfo('用户表示不需要参考图，跳过选图')
+        return { picked: [], needUserImage: false, askMessage: '', reason: '用户表示不需要参考图', ok: true }
+      }
+
+      // ---- 1. 需求分析（不给候选）----
+      const analyzeContent = (selector.analyzePrompt || DEFAULT_ANALYZE_PROMPT)
+        .replace(/\{command\}/g, cmdConfig.name || '')
+        .replace(/\{prompt\}/g, promptText || '')
+        .replace(/\{userInput\}/g, userInput || '（用户未附加说明）')
+
+      const analysisCall = await callSelectorModel(
+        analyzeContent, analyzeContent, false, selector.keywordMaxTokens || 3000,
+        '你是绘图参考图需求分析助手，只输出 JSON，不要挑选图片。'
+      )
+      const analysis = parseAnalysisResult(analysisCall.raw)
+      if (!analysis) {
+        return {
+          picked: [], needUserImage: false, askMessage: '', reason: '', ok: false,
+          error: analysisCall.error || '需求分析没有返回可解析的结果',
+        }
+      }
+      logInfo(`需求分析：主体=${analysis.subject || '（无）'} 硬性=${JSON.stringify(analysis.must)} 加分=${JSON.stringify(analysis.nice)}`)
+
+      if (analysis.skipReference && respectSkip) {
+        logInfo('需求分析判定本次不需要参考图')
+        return {
+          picked: [], needUserImage: false, askMessage: '', reason: '本次不需要参考图',
+          ok: true, keywords: keywordsFromAnalysis(analysis),
+        }
+      }
+
+      // ---- 2. 召回 ----
+      const pool = selector.dedupe === false ? candidates : dedupeCandidates(candidates)
+      const keywords = keywordsFromAnalysis(analysis)
+      const matched = matchCandidatesByKeywords(pool, keywords, topK)
+      // 关键词没命中就退化成「全量截断」：评分阈值会兜住乱选，不会因为召回空就放弃
+      const shortlist = matched.length > 0 ? matched : pool.slice(0, Math.max(topK, 1) * 2)
+      logInfo(`关键词召回 ${shortlist.length}/${pool.length} 张进入打分（关键词：${keywords.join('/') || '无'}）`)
+
+      if (shortlist.length === 0) {
+        return {
+          picked: [], needUserImage: true, askMessage: analysis.needTypes, reason: '候选池里没有图片',
+          ok: true, keywords, recalled: 0, total: pool.length, renderText: analysis.text || undefined,
+        }
+      }
+
+      // ---- 3. 逐图打分（开了识图就把召回图的图片本身一起发过去）----
+      const scoreContent = (selector.scorePrompt || DEFAULT_SCORE_PROMPT)
+        .replace(/\{subject\}/g, analysis.subject || '（未指定）')
+        .replace(/\{must\}/g, analysis.must.length ? analysis.must.join('、') : '（无）')
+        .replace(/\{nice\}/g, analysis.nice.length ? analysis.nice.join('、') : '（无）')
+        .replace(/\{avoid\}/g, analysis.avoid.length ? analysis.avoid.join('、') : '（无）')
+        .replace(/\{candidates\}/g, buildIndexText(shortlist))
+        .replace(/\{max\}/g, String(max))
+
+      const visionOn = selector.vision === true
+      const scoreUserContent = buildSelectorContent(
+        scoreContent, shortlist, visionOn, selector.visionMaxImages || 6
+      )
+      const scoreCall = await callSelectorModel(
+        scoreUserContent, scoreContent, visionOn, selector.selectMaxTokens || 8000,
+        '你是参考图打分助手，只输出 JSON。'
+      )
+      const scored = parseScoreResult(scoreCall.raw, shortlist)
+
+      if (scored.length === 0) {
+        return {
+          picked: [], needUserImage: false, askMessage: '', reason: '', ok: false,
+          keywords, recalled: shortlist.length, total: pool.length,
+          error: scoreCall.error || '打分阶段没有拿到有效的分数',
+        }
+      }
+
+      // ---- 4. 阈值兜底 ----
+      const { picked, best, passed } = selectByScore(scored, shortlist, minScore, max)
+      const detail = scored
+        .slice()
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5)
+        .map(item => `${item.index}:${item.score}分(${item.why || '-'})`)
+        .join('  ')
+      logInfo(`逐图打分（阈值 ${minScore}）：最高 ${best} 分，达标 ${passed} 张，选中 ${picked.length} 张 | ${detail}`)
+
+      const hint = String(extractJsonObject(scoreCall.raw)?.hint || '').trim() || undefined
+
+      return {
+        picked,
+        // 一张都不达标 = 图库里确实没有合适的 -> 让上层去问用户补图，而不是硬塞
+        needUserImage: picked.length === 0,
+        askMessage: picked.length === 0 ? (analysis.needTypes || '') : '',
+        reason: picked.length
+          ? `命中需求（最高 ${best} 分）`
+          : `没有图达到 ${minScore} 分门槛（最高只有 ${best} 分）`,
+        ok: true,
+        keywords,
+        recalled: shortlist.length,
+        total: pool.length,
+        renderText: analysis.text || undefined,
+        hint: visionOn && selector.appendHint !== false ? hint : undefined,
+      }
     }
 
     /** 候选图片索引文本 */
