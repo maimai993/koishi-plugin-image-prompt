@@ -104,6 +104,20 @@ check('★ 融合重写模板不再要求翻英文 / 不再让补一堆细节', 
   assert.ok(!/补足画风、构图、镜头、光线、氛围、配色与细节/.test(t), '不该再要求脑补细节')
 })
 
+check('★ 文字渲染（textRender）整套功能已经删干净', () => {
+  const cfg = build({})
+  assert.ok(!('textRender' in cfg), '配置项不该再有 textRender')
+  // 旧配置里留着 textRender 也不能把解析搞崩（Koishi 会忽略未知字段）
+  const old = build({ textRender: { enabled: true, fontSize: 96 } })
+  assert.ok(old && typeof old === 'object', '残留的旧配置不应影响解析')
+})
+
+check('★ 不再声明 puppeteer 为可选依赖', () => {
+  assert.ok(!plugin.inject.optional.includes('puppeteer'), `optional 不该再含 puppeteer，实际 ${plugin.inject.optional}`)
+  assert.ok(plugin.inject.optional.includes('assets'), 'assets 仍然是可选的')
+  assert.ok(!/文字渲染/.test(plugin.usage), 'usage 里不该再提文字渲染')
+})
+
 check('★ 旧选图相关配置项已经彻底删掉（不再出现在解析结果里）', () => {
   const cfg = build({})
   for (const key of ['selectionMode', 'minScore', 'analyzePrompt', 'scorePrompt', 'keywordPrompt', 'twoStage', 'vision', 'maxSelect']) {

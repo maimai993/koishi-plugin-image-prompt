@@ -129,7 +129,6 @@ async function run(scripts, options = {}) {
     },
     agent: { enabled: true, maxIterations: 6, maxSelect: 3, askTimeout: 2, confirmBeforeDraw: false, historyTurns: 0, debugLog: false },
     resultGallery: { enabled: false },
-    textRender: { enabled: false },
     backgroundDrawing: { enabled: !!options.background },
     nested: {
       commands: [{

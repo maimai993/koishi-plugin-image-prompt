@@ -6,12 +6,11 @@ export const name = 'image-prompt'
 
 /**
  * 依赖声明：http / logger / i18n 是必需的；
- * puppeteer 是**可选**的——只有开启「文字渲染参考图」时才需要浏览器服务，
- * 没装也能正常绘图（Koishi 会在它可用时把它注入进来，并等它就绪后再启动本插件）。
+ * assets 是**可选**的（结果图先上传再发，外链在手机端 QQ 常常拉不到）。
  */
 export const inject = {
   required: ['http', 'logger', 'i18n'],
-  optional: ['puppeteer', 'assets'],
+  optional: ['assets'],
 }
 
 export const usage = `
@@ -59,13 +58,12 @@ export const usage = `
 
 - 「收到提示」默认开：指令触发立刻回一条「收到，正在准备...」，不让用户以为卡住。
 - 「后台绘图」开启后出图不阻塞，先回「正在画」，画好主动推送。
-- 「文字渲染参考图」把画面上的文字（台词/招牌）先渲染成图片一起发给绘图模型，解决中文崩字。
 - 回显提示词、结果图尺寸/走 assets 等都在「消息发送」里。
 
 Agent 指令模板可用占位符：{command} 指令名、{prompt} 指令提示词、{userInput} 用户附加需求、{imageCount} 用户随消息发的图数量、{refCount} 可检索的参考图数量
 
 ---
-此项目所需的koishi服务：必需 'http', 'logger', 'i18n'；可选 'puppeteer'（仅「文字渲染参考图」需要）
+此项目所需的koishi服务：必需 'http', 'logger', 'i18n'；可选 'assets'（结果图上传）
 
 ---
 `;
@@ -853,91 +851,8 @@ export function withTokenParam(body: any, param: string): any {
 }
 
 
-/** HTML 转义，避免渲染时把文字当标签吃掉 */
-export function escapeHtml(text: string): string {
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
 
-/** 把要渲染的文字拼成一份 HTML（供无头浏览器截图） */
-export function buildTextHtml(lines: string[], cfg: Partial<TextRenderConfig> = {}): string {
-  const width = cfg.width || 1024
-  const fontSize = cfg.fontSize || 96
-  const lineHeight = cfg.lineHeight || 1.4
-  const padding = cfg.padding || 48
-  const background = cfg.background || '#ffffff'
-  const color = cfg.color || '#111111'
-  const fontFamily = cfg.fontFamily || 'Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif'
-  const align = cfg.align === 'left' ? 'left' : 'center'
-  const weight = cfg.bold ? '700' : '400'
-  const strokeWidth = cfg.strokeWidth || 0
-  const strokeColor = cfg.strokeColor || '#ffffff'
-  const stroke = strokeWidth > 0
-    ? `-webkit-text-stroke: ${strokeWidth}px ${strokeColor}; paint-order: stroke fill;`
-    : ''
 
-  const body = lines.map(line => `<div class="line">${escapeHtml(line)}</div>`).join('')
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { background: ${background}; }
-#stage { display: inline-block; min-width: ${width}px; padding: ${padding}px; }
-.line { font-family: ${fontFamily}; font-size: ${fontSize}px; line-height: ${lineHeight};
-  color: ${color}; font-weight: ${weight}; text-align: ${align};
-  white-space: pre-wrap; word-break: break-word; ${stroke} }
-</style></head><body><div id="stage">${body}</div></body></html>`
-}
-
-const CJK_RE = /[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\uf900-\ufaff]/
-
-/**
- * 从提示词/用户输入里提取「需要在画面上真实出现的文字」
- * 只提取含中日韩文字的片段——纯英文/数字一般不会因为渲染而崩字
- */
-export function extractTextToRender(text: string, options: { loose?: boolean, maxChars?: number } = {}): string[] {
-  const source = String(text || '')
-  if (!source.trim()) return []
-
-  const maxChars = options.maxChars && options.maxChars > 0 ? options.maxChars : 200
-  const results: string[] = []
-  const push = (raw: string) => {
-    // 去掉两端残留的引号/括号（「台词：」这类规则会把括号一起捕获进来）
-    const value = String(raw || '').trim()
-      .replace(/^[\s"'`「『“《【（(\[]+/, '')
-      .replace(/[\s"'`」』”》】）)\]]+$/, '')
-      .replace(/\s+/g, ' ')
-    if (!value) return
-    if (value.length > maxChars) return
-    if (!CJK_RE.test(value)) return
-    if (results.includes(value)) return
-    results.push(value)
-  }
-
-  const patterns: RegExp[] = [
-    /「([^」\n]{1,200})」/g,
-    /『([^』\n]{1,200})』/g,
-    /“([^”\n]{1,200})”/g,
-    /《([^》\n]{1,200})》/g,
-    /【([^】\n]{1,200})】/g,
-    /"([^"\n]{1,200})"/g,
-    /'([^'\n]{1,200})'/g,
-    /(?:台词|字幕|标语|招牌|标题|写着|写着的是|对话)\s*[:：]?\s*([^\n。；;！!？?]{1,200})/g,
-  ]
-  for (const pattern of patterns) {
-    let match: RegExpExecArray | null
-    while ((match = pattern.exec(source))) push(match[1])
-  }
-
-  // 宽松模式：引号都没用上时，直接抓连续的中文片段（至少 4 个字，成句才像是台词）
-  if (results.length === 0 && options.loose) {
-    const chunks = source.match(/[\u3400-\u4dbf\u4e00-\u9fff][\u3400-\u4dbf\u4e00-\u9fff\u3001\u3002\uff0c\uff01\uff1f\uff1a\u201c\u201d\s]{3,}/g)
-    for (const chunk of chunks || []) push(chunk)
-  }
-
-  return results
-}
 
 interface CommandConfig {
   basename: string
@@ -972,7 +887,6 @@ interface CommandConfig {
   optimizePrompt?: string
   resultGallery?: ResultGalleryConfig
   backgroundDrawing?: BackgroundDrawingConfig
-  textRender?: TextRenderConfig
   /** 指令一触发就立刻回一条「收到」，避免用户以为卡住 */
   ackOnStart?: boolean
   /** 结果图用 markdown 的 ![](url) 单独发一条（支持的平台） */
@@ -988,35 +902,6 @@ interface CommandConfig {
   imageHeight?: number
 }
 
-/** 文字渲染参考图配置（把要在画面上出现的文字先渲染成图片，避免中文崩字） */
-interface TextRenderConfig {
-  enabled: boolean
-  /** 自动从提示词里识别需要出现在画面上的文字并渲染 */
-  autoDetect: boolean
-  /** 引号内没有其它线索时，也允许直接提取中文片段 */
-  loose: boolean
-  /** 手动渲染指令名 */
-  commandName: string
-  /** 手动渲染后，多少秒内的绘图指令自动带上它 */
-  pendingTTL: number
-  /** 渲染后先把参考图发出来给用户看 */
-  sendPreview: boolean
-  /** 渲染结果并入绘图参考图 */
-  attachToDraw: boolean
-  width: number
-  fontSize: number
-  lineHeight: number
-  padding: number
-  background: string
-  color: string
-  fontFamily: string
-  align: 'center' | 'left'
-  bold: boolean
-  strokeWidth: number
-  strokeColor: string
-  maxChars: number
-  scale: number
-}
 
 /** 生成结果入库（图库）配置 */
 interface ResultGalleryConfig {
@@ -1779,33 +1664,6 @@ export const Config: Schema = Schema.intersect([
     promptMaxLength: Schema.number().default(4000).min(0).max(20000).step(100).description('回显提示词的最大字符数，超出部分截断并标注；设为 0 表示不截断（QQ markdown 有长度上限，太长可能被拒收）'),
   }).description('提示词设置'),
 
-  Schema.object({
-    textRender: Schema.object({
-      enabled: Schema.boolean().default(false).description('开启「文字渲染参考图」：把要在画面上出现的文字（台词/标题/标语）先用浏览器渲染成图片，一起发给绘图模型，解决中文崩字问题（需要安装并启用 koishi-plugin-puppeteer）'),
-      autoDetect: Schema.boolean().default(true).description('自动识别提示词里需要出现在画面上的中文文字并渲染（识别「」“”《》【】以及「台词：」等）'),
-      loose: Schema.boolean().default(false).description('宽松模式：引号都没用上时，也直接提取连续的中文片段（可能误判）'),
-      commandName: Schema.string().default('渲染文字').description('手动渲染指令名（挂在主指令根下），用法：渲染文字 要画的文字'),
-      pendingTTL: Schema.number().default(600).min(0).max(86400).step(30).description('手动渲染后，多少秒内的绘图指令自动带上这张参考图（0 表示只在下一次生效前一直有效）'),
-      sendPreview: Schema.boolean().default(true).description('渲染后先把参考图发出来给你看'),
-      attachToDraw: Schema.boolean().default(true).description('把渲染结果并入绘图参考图一起发给绘图模型'),
-      width: Schema.number().default(1024).min(256).max(4096).step(64).description('画布最小宽度（像素）'),
-      fontSize: Schema.number().default(96).min(12).max(400).step(4).description('字号'),
-      lineHeight: Schema.number().default(1.4).min(1).max(3).step(0.1).description('行高'),
-      padding: Schema.number().default(48).min(0).max(400).step(4).description('内边距'),
-      background: Schema.string().default('#ffffff').description('背景色（填 transparent 可输出透明底，适合贴在画面上的字幕）'),
-      color: Schema.string().default('#111111').description('文字颜色'),
-      fontFamily: Schema.string().default('Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif').description('字体（按先后顺序回退）'),
-      align: Schema.union([
-        Schema.const('center').description('居中'),
-        Schema.const('left').description('左对齐'),
-      ]).default('center').description('对齐方式'),
-      bold: Schema.boolean().default(false).description('加粗'),
-      strokeWidth: Schema.number().default(0).min(0).max(40).step(1).description('描边宽度（0 不描边；字幕建议 6-10）'),
-      strokeColor: Schema.string().default('#ffffff').description('描边颜色'),
-      maxChars: Schema.number().default(200).min(10).max(2000).step(10).description('单条文字最大字符数，超过则不渲染'),
-      scale: Schema.number().default(2).min(1).max(4).step(1).description('截图缩放倍数（越大越清晰，文件也越大）'),
-    }).collapse().description('文字渲染配置项'),
-  }).description('文字渲染参考图（防崩字）'),
 
   Schema.object({
     ackOnStart: Schema.boolean().default(true).description('指令一触发就立刻回一条「收到，正在准备...」。后面的「优化提示词 + agent 思考」是两轮模型请求、可能要几十秒，不发这条用户会以为机器人卡住了'),
@@ -2036,13 +1894,6 @@ export function apply(ctx: Context, config: CommandConfig) {
           bgstart: '已开始后台绘图（{0} 张图），画好后会在这里通知你...',
           bgqueue: '（当前有 {0} 个任务在排队）',
           bgdone: '画好了：',
-          textrenderNopp: '文字渲染需要安装并启用 koishi-plugin-puppeteer（浏览器服务）',
-          textrenderEmpty: '请提供要渲染的文字，例如：{0} 你好世界',
-          textrenderFailed: '文字渲染失败：{0}',
-          textrenderOk: '文字参考图已渲染，{0} 秒内的绘图指令会自动带上它',
-          textrenderOkForever: '文字参考图已渲染，下次绘图会自动带上它',
-          textrenderAttached: '（已附上文字参考图：{0}）',
-          textrenderPreview: '文字参考图：'
         },
       }
     })
@@ -2470,21 +2321,7 @@ export function apply(ctx: Context, config: CommandConfig) {
       const commandName = cmdConfig.name
       const requireInput = options.requireInput !== false
       const files = await downloadFiles(imageUrls)
-      let text = promptText
-
-      // 文字渲染参考图（防中文崩字）
-      if (config.textRender?.enabled) {
-        const textRef = await resolveTextReference(session, text, userInputText, '')
-        if (textRef) {
-          files.push(textRef.file)
-          // 提醒绘图模型：画面上的文字以参考图为准，不要自己胡编字形
-          text = `${text}\n\nText in the image must be rendered exactly as shown in the attached text-reference image; copy the glyphs precisely, never distort or invent characters.`
-          logInfo('已附加文字渲染参考图')
-          if (config.textRender?.sendPreview !== false) {
-            await reply(session, [session.text('image-prompt.messages.textrenderPreview'), h.image(textRef.file.data, 'image/png')])
-          }
-        }
-      }
+      const text = promptText
 
       if (files.length === 0 && requireInput) return { ok: false, error: 'invalidimage' }
 
@@ -2717,145 +2554,6 @@ export function apply(ctx: Context, config: CommandConfig) {
       return promptText
     }
 
-    // ============ 文字渲染参考图（防崩字） ============
-    // 手动渲染出来的参考图，按频道暂存，下次绘图自动带上
-    const pendingTextRefs = new Map<string, { file: { data: any, mime: string }, text: string, time: number }>()
-
-    function textRefKey(session: Session): string {
-      return `${session.platform}:${session.channelId || session.userId || ''}`
-    }
-
-    function takePendingTextRef(session: Session): { file: { data: any, mime: string }, text: string } | null {
-      const cfg: TextRenderConfig = config.textRender || ({} as TextRenderConfig)
-      const key = textRefKey(session)
-      const item = pendingTextRefs.get(key)
-      if (!item) return null
-      const ttl = (cfg.pendingTTL || 0) * 1000
-      if (ttl > 0 && Date.now() - item.time > ttl) {
-        pendingTextRefs.delete(key)
-        return null
-      }
-      pendingTextRefs.delete(key) // 一次性：带上一次就消费掉
-      return { file: item.file, text: item.text }
-    }
-
-    /** 用无头浏览器把文字渲染成 PNG（失败返回 null，不影响正常绘图） */
-    async function renderTextToImage(text: string): Promise<{ data: any, mime: string } | null> {
-      const cfg: TextRenderConfig = config.textRender || ({} as TextRenderConfig)
-      const lines = String(text || '').split('\n').map(line => line.trim()).filter(Boolean)
-      if (lines.length === 0) return null
-
-      const puppeteer: any = (ctx as any).puppeteer
-      if (!puppeteer || typeof puppeteer.page !== 'function') {
-        ctx.logger.warn('文字渲染需要 koishi-plugin-puppeteer（浏览器服务），当前不可用')
-        return null
-      }
-
-      const html = buildTextHtml(lines, cfg)
-      let page: any
-      try {
-        page = await puppeteer.page()
-        await page.setViewport({
-          width: cfg.width || 1024,
-          height: 400,
-          deviceScaleFactor: cfg.scale || 2
-        })
-        await page.setContent(html, { waitUntil: 'load' })
-        // 等字体加载完再截图，避免中文回退成方块
-        await page.evaluate(() => (document as any).fonts?.ready).catch(() => { })
-        const stage = await page.$('#stage')
-        const clip = stage ? await stage.boundingBox() : null
-        const transparent = String(cfg.background || '').toLowerCase() === 'transparent'
-        const buffer = clip
-          ? await page.screenshot({ clip, omitBackground: transparent })
-          : await page.screenshot({ omitBackground: transparent })
-        const data = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer as any)
-        logInfo(`文字渲染完成: ${lines.length} 行, ${data.length} 字节`)
-        return { data, mime: 'image/png' }
-      } catch (error) {
-        ctx.logger.warn(`文字渲染失败: ${error}`)
-        return null
-      } finally {
-        try { await page?.close() } catch { }
-      }
-    }
-
-    /**
-     * 取一张文字参考图（只给绘图模型用）
-     * 优先级：手动「渲染文字」指令暂存的 > 选图模型写出来的台词 > 从提示词里正则识别的
-     */
-    async function resolveTextReference(
-      session: Session,
-      promptText: string,
-      userInput: string,
-      modelText?: string
-    ): Promise<{ file: { data: any, mime: string }, text: string } | null> {
-      const cfg: TextRenderConfig = config.textRender || ({} as TextRenderConfig)
-      if (!cfg.enabled || cfg.attachToDraw === false) return null
-
-      // 1. 用户手动渲染过 —— 最明确，直接用
-      const pending = takePendingTextRef(session)
-      if (pending) return pending
-
-      // 2. 选图模型自己写出来的台词/标题
-      const fromModel = (modelText || '').trim()
-      if (fromModel) {
-        const file = await renderTextToImage(fromModel)
-        if (file) return { file, text: fromModel }
-      }
-
-      // 3. 兜底：从提示词 / 用户输入里正则识别
-      if (cfg.autoDetect === false) return null
-      const found = [
-        ...extractTextToRender(promptText, { loose: cfg.loose, maxChars: cfg.maxChars }),
-        ...extractTextToRender(userInput, { loose: cfg.loose, maxChars: cfg.maxChars })
-      ]
-      const text = Array.from(new Set(found)).join('\n')
-      if (!text) return null
-
-      logInfo(`自动识别到需要渲染的文字: ${text}`)
-      const file = await renderTextToImage(text)
-      return file ? { file, text } : null
-    }
-
-    // 手动渲染指令
-    const textCmdName = (config.textRender?.commandName || '渲染文字').trim() || '渲染文字'
-    ctx.command(`${config.basename}/${textCmdName} [...text:text]`)
-      .usage('把文字渲染成图片，作为绘图参考图（解决中文崩字）')
-      .action(async ({ session }, ...args) => {
-        if (!isActive || !ctx.scope.isActive) return
-        if (!session) return
-
-        const quote = h.quote(session.messageId)
-        const cfg: TextRenderConfig = config.textRender || ({} as TextRenderConfig)
-        const raw = args.filter(Boolean).join(' ').trim()
-          || stripCommandName(extractTextFromMessage(session.stripped.content), textCmdName).trim()
-
-        if (!raw) return `${quote}${session.text('image-prompt.messages.textrenderEmpty', [textCmdName])}`
-
-        const puppeteer: any = (ctx as any).puppeteer
-        if (!puppeteer || typeof puppeteer.page !== 'function') {
-          return `${quote}${session.text('image-prompt.messages.textrenderNopp')}`
-        }
-
-        const file = await renderTextToImage(raw)
-        if (!file) return `${quote}${session.text('image-prompt.messages.textrenderFailed', ['渲染异常'])}`
-
-        if (cfg.attachToDraw !== false) {
-          pendingTextRefs.set(textRefKey(session), { file, text: raw, time: Date.now() })
-        }
-
-        const ttl = cfg.pendingTTL || 0
-        const tip = ttl > 0
-          ? session.text('image-prompt.messages.textrenderOk', [ttl])
-          : session.text('image-prompt.messages.textrenderOkForever')
-
-        if (cfg.sendPreview !== false) {
-          await reply(session, [h.image(file.data, 'image/png'), tip])
-          return
-        }
-        return `${quote}${tip}`
-      })
 
     // ============ 选图模型诊断指令 ============
     const debugCmdName = (config.aiSelector?.debugCommand || '测试选图').trim() || '测试选图'
