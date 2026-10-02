@@ -250,11 +250,11 @@ export function buildAgentTools(): any[] {
       type: 'function',
       function: {
         name: 'get_avatar',
-        description: '取某个人的头像当参考图，返回它的编号。userId 留空 = 取发指令的人自己的头像；也可以填「被 @ 的人」列表里的 id。用户说「画我」「用我的头像」「画 @某某」时用它。',
+        description: '取头像当参考图，返回它的编号。**只能取两种人的头像**：发指令的人自己（userId 留空/写 me），或他这次消息里明确 @ 到的人（填上下文「可取头像的人」里列出的 id/名字）。其它 id 一律会被拒绝。',
         parameters: {
           type: 'object',
           properties: {
-            userId: { type: 'string', description: '要取头像的用户 id（取自上下文里的「被 @ 的人」），留空或写 me/self 表示发指令的人自己' },
+            userId: { type: 'string', description: '留空或写 me/self/我 = 发指令的人自己；也可以填上下文里「可取头像的人」列出的 id 或昵称（即被 @ 的人）。**不要自己猜 id**' },
           },
           required: [],
         },
@@ -1161,7 +1161,9 @@ const DEFAULT_AGENT_INSTRUCTIONS = `你是 QQ 群里的绘图助手。用户发�
 - gallery_search：按关键词搜索参考图库。**涉及具体角色/立绘时必须先搜一次**。
   多个关键词用空格分隔（如「白发 立绘」），全部命中的排在最前；搜不到就换个词再搜。
 - ask_user：把问题发给用户**并等他回复**（他发的图也会一起带回来）。
-- get_avatar：取某个人的头像当参考图。userId 留空取发指令者自己；也可以取被 @ 的人的头像。
+- get_avatar：取头像当参考图。**只能取两种人**：发指令的人自己（userId 留空或写 me），
+  以及他这次消息里明确 @ 到的人（填上下文「可取头像的人」里列出的 id 或昵称）。
+  其它任何 id 都会被拒绝，不要猜。
 - draw：真正开始画。把 prompt 和挑中的参考图编号交进去，画好会自动发到群里。
 
 工作规则：
@@ -1183,8 +1185,12 @@ const DEFAULT_AGENT_INSTRUCTIONS = `你是 QQ 群里的绘图助手。用户发�
 8. 【没指定参考图时先问一句】用户这次没发图、没 @ 人、指令本身也没有默认参考图，你也搜不到合适的立绘时，
    **不要直接 draw**。先用 ask_user 问一句要不要参考图，并给出选项（例如「用你自己的头像 / 用 @某某 的头像 /
    我帮你从图库找一张 / 不用参考直接画」）。用户说「不用 / 随便 / 直接画」就立刻开画，**不要问第二次**。
-9. 【要画「我」就用头像】用户说「画我」「用我的形象」「画我和 xxx」却没给图时，用 get_avatar 取他自己的头像；
-   说「画 @某某」时取那个人的头像（一般已经自动带上了，直接用那个编号即可）。
+9. 【头像只能取「我」和「被 @ 的人」】
+   - 用户说「画我」「用我的形象」「我的头像」→ get_avatar 的 userId **留空**，取他自己的头像；
+   - 用户 @ 了谁 → 那个人的头像已经自动带上了（上下文里会列出编号），直接用那个编号即可，
+     需要时也可以把他的 id 或昵称填进 get_avatar 再取一次；
+   - **除此之外没有第三种人**。没 @ 别人时绝不许取别人的头像，也不要自己编 userId
+     （编出来的 id 会拿到完全不相干的人的头像，这是严重错误）。
 10. 【默认不润色，用户点头才润色】把用户的话**原封不动**交给绘图模型就是最好的默认值：
    - **不要**主动扩写、不要补画风/光线/材质/镜头、不要翻成英文、不要加「masterpiece」这类词；
    - 用户明确说「帮我润色 / 优化一下 / 写详细点」时，你才把提示词写得更完整；
@@ -1196,7 +1202,7 @@ const DEFAULT_AGENT_INSTRUCTIONS = `你是 QQ 群里的绘图助手。用户发�
 如果你所在的接口不支持函数调用，就**只输出一行 JSON** 来调用工具，例如：
 {"tool":"gallery_search","args":{"keyword":"白发 立绘"}}
 {"tool":"ask_user","args":{"question":"想要什么画风？"}}
-{"tool":"get_avatar","args":{"userId":""}}
+{"tool":"get_avatar","args":{"userId":""}}（留空 = 发指令的人自己；也可以填被 @ 的人的 id，不许自己编）
 {"tool":"draw","args":{"prompt":"...","references":["ref1","user1"]}}
 不想调用工具时，正常输出给用户看的中文即可。`
 
@@ -1212,7 +1218,7 @@ const AGENT_CONFIRM_RULE_OFF = `用户需求已经明确的，直接调用 draw�
 const AGENT_JSON_FALLBACK_RULE = `（注意：当前接口不支持函数调用）请你**只用一行 JSON** 来调用工具，不要输出别的内容：
 {"tool":"gallery_search","args":{"keyword":"白发 立绘"}}
 {"tool":"ask_user","args":{"question":"想要什么画风？"}}
-{"tool":"get_avatar","args":{"userId":""}}
+{"tool":"get_avatar","args":{"userId":""}}（留空 = 发指令的人自己；也可以填被 @ 的人的 id，不许自己编）
 {"tool":"draw","args":{"prompt":"...","references":["ref1","ref2"]}}
 不需要调用工具时，正常输出给用户看的中文即可。`
 
@@ -2144,6 +2150,28 @@ export function apply(ctx: Context, config: CommandConfig) {
       let selfAvatarId = ''
       const atAvatarIds: string[] = []
       const atAvatarById = new Map<string, string>()
+      /**
+       * 本次**允许**取头像的人：只有发指令者自己 + 他明确 @ 到的人。
+       * 为什么必须挡：头像是按 id 拼 URL 的，而 QQ 的头像服务对**任何** id 都会返回一张图
+       * （查无此人时给默认头像），所以模型随手编一个 id 也能「成功」拿到陌生人的头像。
+       * 没有明确 @ 就不是明确指定，一律拒绝。
+       */
+      const avatarAllowed = new Map<string, string>()
+      avatarAllowed.set(session.userId, '发指令的人自己')
+      for (const t of atTargets) if (t.id) avatarAllowed.set(t.id, t.name || t.id)
+      /** 把「我 / me / 空 / 昵称」解析成一个被允许的 userId，解析不出来返回空 */
+      const resolveAvatarUser = (raw: string): string => {
+        const text = String(raw || '').trim()
+        if (!text || text === session.userId || /^(me|self|自己|我|本人|我的头像|我自己)$/i.test(text)) {
+          return session.userId
+        }
+        if (avatarAllowed.has(text)) return text
+        const lower = text.toLowerCase()
+        for (const [id, name] of avatarAllowed) {
+          if (name && (name === text || name.toLowerCase() === lower)) return id
+        }
+        return ''
+      }
       if (avatarOn) {
         const selfUrl = await fetchAvatarUrl(session, session.userId)
         if (selfUrl) {
@@ -2171,8 +2199,8 @@ export function apply(ctx: Context, config: CommandConfig) {
 
       const messages: any[] = [
         { role: 'system', content: buildAgentSystemPrompt(cmdConfig, userInputText, pool.length, {
-          userIds, baseIds, atAvatarIds, selfAvatarId, atTargets,
-        }, agentCfg) },
+          userIds, baseIds, atAvatarIds, selfAvatarId, atTargets, selfUserId: session.userId,
+        }, agentCfg, avatarAllowed) },
         ...history,
         { role: 'user', content: userInputText ? userInputText : '（用户没有附加说明，请按指令自带的提示词来）' },
       ]
@@ -2279,28 +2307,36 @@ export function apply(ctx: Context, config: CommandConfig) {
         })
       }
 
-      /** 取某人头像：留空取发指令的人，也可以取被 @ 的人 */
+      /** 取头像：只能是发指令的人自己，或他这次明确 @ 到的人 */
       async function toolGetAvatar(args: any): Promise<string> {
         if (!avatarOn) return JSON.stringify({ ok: false, error: '头像参考图功能已关闭' })
         const raw = String(args?.userId ?? args?.id ?? args?.user ?? '').trim()
-        if (!raw || /^(me|self|自己|我)$/i.test(raw) || raw === session.userId) {
-          if (selfAvatarId) {
-            return JSON.stringify({ ok: true, id: selfAvatarId, userId: session.userId, note: '发指令的人自己的头像' })
-          }
-          const url = await fetchAvatarUrl(session, session.userId)
-          if (!url) return JSON.stringify({ ok: false, error: '没取到他自己的头像（这个平台可能不提供头像地址）' })
-          selfAvatarId = register('avatar', url, '发指令的人的头像', '头像')
-          return JSON.stringify({ ok: true, id: selfAvatarId, userId: session.userId, note: '发指令的人自己的头像' })
+        const userId = resolveAvatarUser(raw)
+
+        if (!userId) {
+          const options = [...avatarAllowed.entries()].map(([id, name]) => ({ userId: id, who: name }))
+          return JSON.stringify({
+            ok: false,
+            error: `不认识「${raw}」。头像只能取「发指令的人自己」和「他这次 @ 到的人」，不能自己编 id`,
+            available: options,
+            note: `要画的如果是发指令的人自己，把 userId 留空再调一次；如果是别人，让他 @ 那个人再发一次指令。现在可取：${options.map(o => o.who).join('、')}`,
+          })
         }
 
-        const cached = atAvatarById.get(raw)
-        if (cached) return JSON.stringify({ ok: true, id: cached, userId: raw, note: '被 @ 的人的头像' })
+        const isSelf = userId === session.userId
+        const who = avatarAllowed.get(userId) || (isSelf ? '发指令的人自己' : userId)
 
-        const url = await fetchAvatarUrl(session, raw)
-        if (!url) return JSON.stringify({ ok: false, error: `没取到 ${raw} 的头像` })
-        const id = register('avatar', url, `${raw} 的头像`, '头像')
-        atAvatarById.set(raw, id)
-        return JSON.stringify({ ok: true, id, userId: raw, note: '这个人的头像' })
+        const cached = isSelf ? selfAvatarId : atAvatarById.get(userId)
+        if (cached) return JSON.stringify({ ok: true, id: cached, userId, note: `${who}的头像` })
+
+        const url = await fetchAvatarUrl(session, userId)
+        if (!url) {
+          return JSON.stringify({ ok: false, error: `没取到「${who}」的头像（这个平台可能不提供头像地址）` })
+        }
+        const id = register('avatar', url, `${who}的头像`, '头像')
+        if (isSelf) selfAvatarId = id
+        else atAvatarById.set(userId, id)
+        return JSON.stringify({ ok: true, id, userId, note: `${who}的头像` })
       }
 
       /** 提问并等用户的下一条消息（图也会一起带回来） */
@@ -2341,21 +2377,35 @@ export function apply(ctx: Context, config: CommandConfig) {
         if (avatarOn) {
           if (avatarCfg.autoAt !== false) {
             for (const target of extractAtIds(String(answer || ''), session.selfId)) {
+              if (!target.id) continue
+              // 他在回复里明确 @ 了，这个人从此也进入白名单
+              if (!avatarAllowed.has(target.id)) avatarAllowed.set(target.id, target.name || target.id)
+              const who = avatarAllowed.get(target.id) || target.id
               const cached = atAvatarById.get(target.id)
               if (cached) {
-                if (!avatars.some(a => a.id === cached)) avatars.push({ id: cached, note: `${target.name || target.id} 的头像` })
+                if (!avatars.some(a => a.id === cached)) avatars.push({ id: cached, note: `${who} 的头像` })
                 continue
               }
               const url = await fetchAvatarUrl(session, target.id)
               if (!url) continue
-              const id = register('avatar', url, `${target.name || target.id} 的头像`, '头像')
+              const id = register('avatar', url, `${who} 的头像`, '头像')
               atAvatarById.set(target.id, id)
-              avatars.push({ id, note: `${target.name || target.id} 的头像` })
+              if (!atAvatarIds.includes(id)) atAvatarIds.push(id)
+              avatars.push({ id, note: `${who} 的头像` })
             }
           }
           // 「用我的头像」「画我」——就算关闭了 autoSelf，用户明确开口了就给他
-          if (/头像|我的形象|画我|我自己/.test(text) && selfAvatarId) {
-            if (!avatars.some(a => a.id === selfAvatarId)) avatars.push({ id: selfAvatarId, note: '发指令的人自己的头像' })
+          if (/头像|我的形象|画我|我自己/.test(text) && !avatars.some(a => a.id === selfAvatarId)) {
+            // 用户明确开口要自己的头像，没登记过就现取一次
+            let id = selfAvatarId
+            if (!id) {
+              const url = await fetchAvatarUrl(session, session.userId)
+              if (url) {
+                id = register('avatar', url, '发指令的人的头像', '头像')
+                selfAvatarId = id
+              }
+            }
+            if (id) avatars.push({ id, note: '发指令的人自己的头像' })
           }
         }
 
@@ -2454,8 +2504,10 @@ export function apply(ctx: Context, config: CommandConfig) {
         atAvatarIds: string[]
         selfAvatarId: string
         atTargets: { id: string, name: string }[]
+        selfUserId: string
       },
-      agentCfg: AgentConfig
+      agentCfg: AgentConfig,
+      avatarAllowed?: Map<string, string>
     ): string {
       const instructions = renderAgentInstructions(agentCfg.instructions || DEFAULT_AGENT_INSTRUCTIONS, {
         command: cmdConfig.name || '',
@@ -2474,16 +2526,33 @@ export function apply(ctx: Context, config: CommandConfig) {
         `- 图库里可以搜到的参考图：${refCount} 张`,
       ]
       if (refs.baseIds.length) lines.push(`- 指令默认参考图（已自动带上，不用再填）：${refs.baseIds.join('、')}`)
-      if (refs.selfAvatarId) lines.push(`- 发指令的人自己的头像：${refs.selfAvatarId}（他想画「我」时用这个，或用 get_avatar 取）`)
-      if (refs.atAvatarIds.length) {
-        const who = refs.atTargets.map(t => `${t.name || t.id}`).join('、')
-        lines.push(`- 被 @ 的人的头像（已自动带上，不用再填）：${refs.atAvatarIds.join('、')}（分别是 ${who} 的头像）`)
-      } else if (refs.atTargets.length) {
-        lines.push(`- 用户 @ 了 ${refs.atTargets.map(t => t.name || t.id).join('、')}，但没取到他们的头像，需要的话用 get_avatar 再试`)
-      }
       if (cmdConfig.custom) lines.push('- 这是自定义指令：用户没说清楚要画什么时，先用 ask_user 问一句')
 
-      return instructions + lines.join('\n')
+      // 头像：只列「发指令的人自己」+「被 @ 的人」，并写明其它 id 一律拒绝
+      const avatarLines: string[] = ['', '## 可取头像的人（get_avatar 只认这些）']
+      if (refs.selfAvatarId) {
+        avatarLines.push(`- 发指令的人自己：编号 ${refs.selfAvatarId}（他想画「我」时用这个编号，或 get_avatar 的 userId 留空再取一次）`)
+      } else {
+        avatarLines.push('- 发指令的人自己：get_avatar 的 userId **留空**即可（这轮还没提前取，取了才有编号）')
+      }
+      if (refs.atAvatarIds.length) {
+        const pairs = refs.atTargets.map((t, i) => `${refs.atAvatarIds[i] || '?'}=${t.name || t.id}`).join('、')
+        avatarLines.push(`- 被 @ 的人（已自动带上，不用再填）：${pairs}`)
+      } else if (refs.atTargets.length) {
+        avatarLines.push(`- 被 @ 的人：${refs.atTargets.map(t => `${t.name || t.id}（id=${t.id}）`).join('、')}，还没取到头像，需要就用 get_avatar 填他的 id 再试`)
+      }
+      const others = [...(avatarAllowed || new Map<string, string>()).entries()]
+        .filter(([id]) => id !== refs.selfUserId && !refs.atTargets.some(t => t.id === id))
+      if (others.length) {
+        avatarLines.push(`- 后续对话里又 @ 到的：${others.map(([id, name]) => `${name}（id=${id}）`).join('、')}`)
+      }
+      if (refs.atTargets.length || others.length) {
+        avatarLines.push('- 上面这些人之外的 id **一律会被拒绝**，不要从图库描述、历史消息或任何别处抄一个 id 当头像用')
+      } else {
+        avatarLines.push('- 这次没有 @ 任何人，所以**只能取发指令者自己的头像**（userId 留空）。不要填任何 id')
+      }
+
+      return instructions + lines.join('\n') + avatarLines.join('\n')
     }
 
     /** 发一次 agent 请求，返回助手消息与它想调的工具 */

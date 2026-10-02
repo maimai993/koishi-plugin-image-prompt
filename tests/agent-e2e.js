@@ -563,7 +563,7 @@ async function main() {
     })
     check('★ 系统提示词里写清了这是谁的头像', () => {
       const sys = r.agentCalls[0].body.messages[0].content
-      assert.ok(/被 @ 的人的头像（已自动带上/.test(sys), '应列出头像编号')
+      assert.ok(/被 @ 的人（已自动带上/.test(sys), '应列出头像编号')
       assert.ok(/小明/.test(sys), '应写清是谁的头像')
     })
     check('★ 自己没被 @，就不会自动带上自己的头像', () => {
@@ -593,6 +593,77 @@ async function main() {
     check('★ 这个编号真的能用在 draw 上', () => {
       const urls = imageUrls(r.drawCalls[0])
       assert.ok(urls.some(u => u.includes('self-avatar')), `应带上自己头像，实际: ${urls}`)
+    })
+  }
+
+  console.log('12) 没 @ 任何人 -> 模型编的 userId 一律拒绝（不会拿到陌生人的头像）')
+  {
+    const r = await run([[
+      { toolCalls: [{ name: 'get_avatar', args: { userId: 'stranger-999' } }] },
+      { toolCalls: [{ name: 'draw', args: { prompt: '画我吃瓜' } }] },
+      '好了',
+    ]], {
+      botConfigId: '1020test',
+      authorAvatar: 'https://img/self-avatar.png',
+      agent: { askBeforePolish: false },
+    })
+
+    check('★ 编造的 userId 被拒绝', () => {
+      const toolMsgs = r.agentCalls[1].body.messages.filter(m => m.role === 'tool')
+      const payload = JSON.parse(toolMsgs[toolMsgs.length - 1].content)
+      assert.strictEqual(payload.ok, false, `应拒绝，实际: ${JSON.stringify(payload)}`)
+      assert.ok(/不认识/.test(payload.error), `应说明不认识，实际: ${payload.error}`)
+      const who = (payload.available || []).map(o => o.who).join('、')
+      assert.ok(/自己/.test(who) && !/小明|stranger/.test(who), `白名单只该有自己，实际: ${who}`)
+    })
+    check('★ 拒绝之后绘图里没有出现任何陌生头像', () => {
+      const urls = imageUrls(r.drawCalls[0])
+      assert.ok(!urls.some(u => /stranger-999/.test(u)), `绝不该带陌生人的头像，实际: ${urls}`)
+    })
+    check('★ 系统提示词写明这次只能取他自己的头像', () => {
+      const sys = r.agentCalls[0].body.messages[0].content
+      assert.ok(/只能取发指令者自己的头像/.test(sys), `应写明，实际: ${sys.slice(-300)}`)
+    })
+  }
+
+  console.log('13) @ 了人 -> 只有自己和被 @ 的人能取，其它 id 仍然拒绝')
+  {
+    const r = await run([[
+      { toolCalls: [{ name: 'get_avatar', args: { userId: 'user-2' } }] },
+      { toolCalls: [{ name: 'get_avatar', args: { userId: '小明' } }] },
+      { toolCalls: [{ name: 'get_avatar', args: { userId: 'stranger-999' } }] },
+      { toolCalls: [{ name: 'draw', args: { prompt: '画我和小明的合照' } }] },
+      '好了',
+    ]], {
+      atTargets: [{ id: 'user-2', name: '小明' }],
+      botConfigId: '1020test',
+      agent: { askBeforePolish: false },
+    })
+
+    const payloadOf = (i) => {
+      const toolMsgs = r.agentCalls[i].body.messages.filter(m => m.role === 'tool')
+      return JSON.parse(toolMsgs[toolMsgs.length - 1].content)
+    }
+
+    check('★ 填被 @ 的人的 id 能取到', () => {
+      const p = payloadOf(1)
+      assert.strictEqual(p.ok, true, `应取到，实际: ${JSON.stringify(p)}`)
+      assert.strictEqual(p.userId, 'user-2')
+    })
+    check('★ 填他的昵称也能取到，而且是同一个编号', () => {
+      const a = payloadOf(1), b = payloadOf(2)
+      assert.strictEqual(b.ok, true, `昵称应能取到，实际: ${JSON.stringify(b)}`)
+      assert.strictEqual(b.id, a.id, '同一个人的头像不该重复登记')
+    })
+    check('★ 不在白名单里的 id 依然被拒绝', () => {
+      const p = payloadOf(3)
+      assert.strictEqual(p.ok, false, `应拒绝，实际: ${JSON.stringify(p)}`)
+      assert.ok(/不认识/.test(p.error))
+    })
+    check('★ 绘图只带了被 @ 的人的头像', () => {
+      const urls = imageUrls(r.drawCalls[0])
+      assert.ok(urls.some(u => /q\.qlogo\.cn\/qqapp\/1020test\/user-2/.test(u)), `应带小明头像，实际: ${urls}`)
+      assert.ok(!urls.some(u => /stranger-999/.test(u)), `不该有陌生人头像，实际: ${urls}`)
     })
   }
 
