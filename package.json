@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-image-prompt",
   "description": "多功能 AI 图像处理插件：Agent 模式把「查不查图库 / 要不要追问 / 什么时候开画」全交给模型自己决定，支持手办化、Coser 化、Minecraft 化等 47 种风格与自定义提示词",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

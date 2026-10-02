@@ -81,11 +81,32 @@ const logger = new Logger(name)
  */
 export function computeRetryDelay(status: any, retryAfter: number | undefined, baseInterval: number, attempt: number): number {
   const base = baseInterval > 0 ? baseInterval : 1000
-  if (status === 429 || status === 503) {
+  // 429 限流、5xx 服务端错误、status=0（网络层就断了）都值得退避：
+  // 上游节点挂了的时候，固定间隔连着猛打四次只是徒增负担
+  const worthBackoff = status === 429 || status === 503 || (typeof status === 'number' && status >= 500) || status === 0
+  if (worthBackoff) {
     if (retryAfter && retryAfter > 0) return retryAfter
     return Math.min(base * Math.pow(2, attempt), 30000)
   }
   return base
+}
+
+/**
+ * 从接口抛出的错误里挖出「到底为什么失败」。
+ * koishi 的 http 错误对 5xx 往往只留一句状态文本（"Internal Server Error"），
+ * 真正的病根（比如上游 ECONNREFUSED、模型负载过高）藏在响应体里，得自己捞出来。
+ */
+export function httpErrorText(error: any): string {
+  if (!error) return '未知原因'
+  const data = error?.response?.data ?? error?.data ?? error?.response
+  const upstream = typeof data === 'string'
+    ? data
+    : data?.error?.message ?? data?.message ?? data?.msg
+  let text = String(error?.message || error?.toString?.() || '未知原因').trim()
+  if (typeof upstream === 'string' && upstream.trim() && !text.includes(upstream.trim())) {
+    text = `${text}｜接口返回：${upstream.trim().slice(0, 200)}`
+  }
+  return text
 }
 
 /** 从任意文本里挖出第一个 JSON 对象（容忍代码块围栏和前后废话） */
@@ -2303,8 +2324,16 @@ export function apply(ctx: Context, config: CommandConfig) {
           references: capped,
           ...(unknown.length ? { unknown } : {}),
           ...(res.ok
-            ? { note: '图已经发到群里了，回一句简短说明即可，不要再问「还要我做什么」' }
-            : { error: res.error === 'invalidimage' ? '这些参考图一张都下载不下来，检查链接还能不能访问' : '绘图接口没有返回图片' }),
+            ? (res.queued
+              // 后台绘图：这里只是排上队了，图还没开始画，绝不能让模型告诉用户「画好了」
+              ? { queued: true, note: '绘图任务已排进后台队列，还没有画完。请告诉用户「已经排上队，画好后会在这里通知」，不要说已经画好或已经发出图片' }
+              : { sent: true, note: '图已经发到群里了，回一句简短说明即可，不要再问「还要我做什么」' })
+            : {
+              error: res.error === 'invalidimage'
+                ? '这些参考图一张都下载不下来，检查链接还能不能访问'
+                : `绘图接口这次没出图：${(res.reason || '未知原因').slice(0, 160)}`,
+              note: '如实告诉用户这次没画出来、可能是什么原因，并建议稍后再试或换个模型，不要说已经画好了',
+            }),
         })
       }
     }
@@ -2428,7 +2457,7 @@ export function apply(ctx: Context, config: CommandConfig) {
       imageUrls: string[],
       userInputText: string,
       options: { optimizeFailed?: boolean, requireInput?: boolean } = {}
-    ): Promise<{ ok: boolean, error?: string, url?: string }> {
+    ): Promise<{ ok: boolean, error?: string, url?: string, reason?: string, queued?: boolean }> {
       const commandName = cmdConfig.name
       const requireInput = options.requireInput !== false
       const files = await downloadFiles(imageUrls)
@@ -2474,18 +2503,26 @@ export function apply(ctx: Context, config: CommandConfig) {
             failed: session.text('image-prompt.messages.failed'),
             error: session.text('image-prompt.messages.error'),
           },
+          /** 带上接口给的真实原因，用户一看就知道是模型那边的问题还是自己配置的问题 */
+          formatFailed: (reason?: string) => {
+            const head = String(session.text('image-prompt.messages.failed') || '').replace(/[，,。]\s*$/, '')
+            if (!reason) return `${head}。`
+            const clean = String(reason).replace(/\s+/g, ' ').trim()
+            return `${head}（${clean.slice(0, 120)}）`
+          },
         }
         const queued = enqueueDrawJob(snapshot, files)
         await sendNotice(session, `${session.text('image-prompt.messages.bgstart', [files.length])}${queued > 0 ? session.text('image-prompt.messages.bgqueue', [queued]) : ''}`)
-        return { ok: true }
+        // 注意：这里是「排上队了」，不是「画好了」。别让上层当成已完成通知用户
+        return { ok: true, queued: true }
       }
 
-      const result = await generateFigureImage(files, text)
-      if (!result) return { ok: false, error: 'failed' }
+      const gen = await generateFigureImage(files, text)
+      if (!gen.url) return { ok: false, error: 'failed', reason: gen.reason }
 
-      await saveToGallery(result, buildGalleryDescription(text, userInputText), commandName)
-      await sendResultImage(session, result, commandName)
-      return { ok: true, url: result }
+      await saveToGallery(gen.url, buildGalleryDescription(text, userInputText), commandName)
+      await sendResultImage(session, gen.url, commandName)
+      return { ok: true, url: gen.url }
     }
 
     /** 发一条状态说明（支持的平台用 markdown，省得长文被拆） */
@@ -2565,7 +2602,9 @@ export function apply(ctx: Context, config: CommandConfig) {
       if (!res.ok) {
         return res.error === 'invalidimage'
           ? session.text('image-prompt.messages.invalidimage')
-          : session.text('image-prompt.messages.failed')
+          : res.reason
+            ? `${String(session.text('image-prompt.messages.failed') || '').replace(/[，,。]\s*$/, '')}（${res.reason.replace(/\s+/g, ' ').trim().slice(0, 120)}）`
+            : session.text('image-prompt.messages.failed')
       }
     }
     // ============ 后台绘图 ============
@@ -2598,13 +2637,13 @@ export function apply(ctx: Context, config: CommandConfig) {
 
       try {
         if (!isActive || !ctx.scope.isActive) return
-        const result = await generateFigureImage(files, snapshot.promptText)
-        if (!result) {
-          await send([snapshot.texts.failed])
+        const gen = await generateFigureImage(files, snapshot.promptText)
+        if (!gen.url) {
+          await send([snapshot.formatFailed ? snapshot.formatFailed(gen.reason) : snapshot.texts.failed])
           return
         }
-        await saveToGallery(result, buildGalleryDescription(snapshot.promptText, ''), snapshot.commandName)
-        await send([`${snapshot.texts.done}\n`, await buildResultImagePart(result)])
+        await saveToGallery(gen.url, buildGalleryDescription(snapshot.promptText, ''), snapshot.commandName)
+        await send([`${snapshot.texts.done}\n`, await buildResultImagePart(gen.url)])
       } catch (error) {
         ctx.logger.error(`[${snapshot.commandName}] 后台绘图失败:`, error)
         try {
@@ -3273,7 +3312,8 @@ export function apply(ctx: Context, config: CommandConfig) {
       return images
     }
 
-    async function generateFigureImage(files: any[], prompt: string): Promise<string | null> {
+    /** @returns 图片地址；失败时带回接口给的真实原因，方便直接告诉用户「是模型那边的毛病」 */
+    async function generateFigureImage(files: any[], prompt: string): Promise<{ url: string | null, reason?: string }> {
       try {
         const dataUrls: string[] = []
 
@@ -3352,22 +3392,24 @@ export function apply(ctx: Context, config: CommandConfig) {
         return await sendChatRequest(requestBody)
       } catch (error) {
         ctx.logger.error(`生成图片时发生错误: ${error}`)
-        return null
+        return { url: null, reason: String(error?.message || error) }
       }
     }
 
-    async function sendChatRequest(requestBody: any): Promise<string | null> {
+    async function sendChatRequest(requestBody: any): Promise<{ url: string | null, reason?: string }> {
       let retryCount = 0
+      const maxAttempts = (config.maxRetries ?? 0) + 1
+      let lastReason = ''
 
-      while (retryCount <= config.maxRetries) {
+      while (retryCount < maxAttempts) {
         // 在每次重试前检查上下文状态
         if (!isActive || !ctx.scope.isActive) {
           ctx.logger.info('插件已卸载，停止重试')
-          return null
+          return { url: null, reason: lastReason }
         }
 
         try {
-          logInfo(`发送请求到 ${config.baseUrl}，第 ${retryCount + 1} 次尝试`)
+          logInfo(`发送请求到 ${config.baseUrl}，第 ${retryCount + 1}/${maxAttempts} 次尝试`)
 
           const headers: Record<string, string> = {
             'Content-Type': 'application/json'
@@ -3389,40 +3431,41 @@ export function apply(ctx: Context, config: CommandConfig) {
               if (markdownMatch && markdownMatch[1]) {
                 const imageUrl = markdownMatch[1]
                 logInfo(`成功获取图片URL: ${imageUrl}`)
-                return imageUrl
+                return { url: imageUrl }
               }
             }
           }
 
-          const errorMsg = '响应中未找到图片URL'
-          throw new Error(errorMsg)
+          throw new Error('响应中未找到图片URL')
         } catch (error) {
           retryCount++
-          const errorMessage = error.message || error.toString()
-          const statusCode = error.response?.status || 0
+          const reason = httpErrorText(error)
+          lastReason = reason
+          const statusCode = error.response?.status || error.status || error.code || 0
 
-          logInfo(`请求失败 (${retryCount}/${config.maxRetries}): ${errorMessage}`)
+          logInfo(`请求失败（第 ${retryCount}/${maxAttempts} 次）：${reason}`)
 
           // 检查是否为配额不足错误
-          if (errorMessage.includes('insufficient_quota') || statusCode === 429) {
+          if (reason.includes('insufficient_quota') || statusCode === 429) {
             ctx.logger.error('API 配额不足，停止重试')
-            return null
+            return { url: null, reason }
           }
 
-          if (retryCount <= config.maxRetries) {
-            logInfo(`等待 ${config.retryInterval}ms 后重试`)
-            await sleep(config.retryInterval)
+          if (retryCount < maxAttempts) {
+            // 服务端错误/网络错误走指数退避，别用固定间隔猛打
+            const delay = computeRetryDelay(statusCode, undefined, config.retryInterval, retryCount - 1)
+            logInfo(`${delay}ms 后重试`)
+            await sleep(delay)
             if (!isActive || !ctx.scope.isActive) {
               ctx.logger.info('插件已卸载，停止重试')
-              return null
+              return { url: null, reason }
             }
           } else {
-            ctx.logger.error(`达到最大重试次数 (${config.maxRetries})，最后错误: ${errorMessage}`)
-            return null
+            ctx.logger.error(`已重试 ${maxAttempts} 次仍失败，最后错误：${reason}`)
           }
         }
       }
-      return null
+      return { url: null, reason: lastReason }
     }
 
     function logInfo(...args: any[]) {

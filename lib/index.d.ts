@@ -18,6 +18,12 @@ export declare const usage = "\n---\n\n\u6B64\u63D2\u4EF6\u76F4\u63A5\u8C03\u752
  * @param attempt 第几次重试（从 0 开始）
  */
 export declare function computeRetryDelay(status: any, retryAfter: number | undefined, baseInterval: number, attempt: number): number;
+/**
+ * 从接口抛出的错误里挖出「到底为什么失败」。
+ * koishi 的 http 错误对 5xx 往往只留一句状态文本（"Internal Server Error"），
+ * 真正的病根（比如上游 ECONNREFUSED、模型负载过高）藏在响应体里，得自己捞出来。
+ */
+export declare function httpErrorText(error: any): string;
 /** 从任意文本里挖出第一个 JSON 对象（容忍代码块围栏和前后废话） */
 export declare function extractJsonObject(raw: string | null | undefined): any | null;
 /**
