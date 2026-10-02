@@ -73,6 +73,37 @@ check('★ Agent 指令模板：说了三个工具 + 带开画确认占位符', 
   assert.ok(/不要编造|绝对不要编造/.test(t), '应禁止编造图片编号')
 })
 
+check('★ 画图工具定义里不再鼓吹「英文效果更稳」', () => {
+  const draw = plugin.buildAgentTools().find(tool => tool.function.name === 'draw')
+  const desc = JSON.stringify(draw)
+  assert.ok(!/英文效果更稳/.test(desc), '不该再引导模型写英文')
+  assert.ok(/中文即可|听得懂中文/.test(desc), '应说明中文就行')
+  assert.ok(/不要.*几百字|简短/.test(desc), '应要求简短，别扩写')
+})
+
+check('★ Agent 提示词要求「短、说人话、别翻英文」', () => {
+  const t = build({}).agent.instructions
+  assert.ok(/听得懂中文/.test(t), '应点明绘图模型听得懂中文')
+  assert.ok(/不要.*扩写|几百字/.test(t), '应禁止扩写成几百字')
+  assert.ok(/不要替他脑补|不要.*脑补/.test(t), '应禁止替用户脑补细节')
+})
+
+check('★ 提示词默认「原话直出」，不再默认扩写', () => {
+  assert.strictEqual(build({}).promptOptimize, 'passthrough')
+  const modes = ['passthrough', 'merge', 'rewrite', 'off']
+  for (const m of modes) {
+    assert.strictEqual(build({ promptOptimize: m }).promptOptimize, m, `${m} 应可设置`)
+  }
+})
+
+check('★ 融合重写模板不再要求翻英文 / 不再让补一堆细节', () => {
+  const t = build({}).optimizePrompt
+  assert.ok(!/英文提示词出图效果通常更稳/.test(t), '不该再引导翻英文')
+  assert.ok(/语言跟着用户走/.test(t), '应让语言跟着用户')
+  assert.ok(/宁短勿长/.test(t), '应强调宁短勿长')
+  assert.ok(!/补足画风、构图、镜头、光线、氛围、配色与细节/.test(t), '不该再要求脑补细节')
+})
+
 check('★ 旧选图相关配置项已经彻底删掉（不再出现在解析结果里）', () => {
   const cfg = build({})
   for (const key of ['selectionMode', 'minScore', 'analyzePrompt', 'scorePrompt', 'keywordPrompt', 'twoStage', 'vision', 'maxSelect']) {

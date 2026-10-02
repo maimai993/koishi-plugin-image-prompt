@@ -222,7 +222,7 @@ interface CommandConfig {
     showPrompt?: boolean;
     promptMaxLength?: number;
     appendUserInput?: boolean;
-    promptOptimize?: 'off' | 'merge' | 'rewrite';
+    promptOptimize?: 'off' | 'passthrough' | 'merge' | 'rewrite';
     optimizePrompt?: string;
     resultGallery?: ResultGalleryConfig;
     backgroundDrawing?: BackgroundDrawingConfig;

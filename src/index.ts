@@ -256,7 +256,8 @@ export function buildAgentTools(): any[] {
         parameters: {
           type: 'object',
           properties: {
-            prompt: { type: 'string', description: '完整的绘图提示词（英文效果更稳；画面上必须出现的文字要原样写进去）' },
+            // 提示词要短：宁可朴素，也不要堆术语写成几百字的「专业」prompt
+            prompt: { type: 'string', description: '绘图提示词。说人话、写简短就行，中文即可（绘图模型听得懂中文）；不要把用户的话扩写成几百字，也不要堆砌风格/材质/光线术语。画面上必须出现的文字要原样写进去' },
             references: {
               type: 'array',
               items: { type: 'string' },
@@ -967,7 +968,7 @@ interface CommandConfig {
   showPrompt?: boolean
   promptMaxLength?: number
   appendUserInput?: boolean
-  promptOptimize?: 'off' | 'merge' | 'rewrite'
+  promptOptimize?: 'off' | 'passthrough' | 'merge' | 'rewrite'
   optimizePrompt?: string
   resultGallery?: ResultGalleryConfig
   backgroundDrawing?: BackgroundDrawingConfig
@@ -1134,13 +1135,15 @@ interface CandidateImage {
 /** 把用户附加需求融合进原始提示词（而不是贴在最末尾） */
 const DEFAULT_OPTIMIZE_PROMPT = `你是绘图提示词优化助手。下面是「绘图指令的原始提示词」和「用户本次的需求」。
 
-请输出一份完整、可直接用于绘图模型的提示词。规则：
+请输出一份**简短**的、可直接用于绘图模型的提示词。规则：
 
-1. 原始提示词不为空时：把用户需求自然地融合进原始提示词，并**保留原始提示词中的全部场景、构图、风格、材质、光线等细节**，不得删减或简化。
-2. 原始提示词为空时（例如自定义指令）：根据用户需求**扩写**成完整的绘图提示词，补足画风、构图、镜头、光线、氛围、配色与细节，但不要改变用户的原意。
-3. 把用户需求写到它该去的位置（表情/动作/神态/服装/场景/互动等），不要原样贴在末尾。
-4. 语言：原始提示词是英文就输出英文；原始提示词为空时也用英文（英文提示词出图效果通常更稳）。
-5. 只输出优化后的提示词正文，不要解释、不要标题、不要 Markdown 代码块、不要引号。
+1. 原始提示词不为空时：把用户需求自然地融入原始提示词，保留其中的构图与风格，不要删减。
+2. 原始提示词为空时：直接整理用户的话作为提示词，**不要替他脑补**画风、镜头、光线、氛围、配色之类的细节 ——
+   用户没提的就别写。
+3. 把用户需求写到它该去的位置，不要原样贴在末尾，也不要另起一段复述一遍。
+4. **语言跟着用户走**：用户用中文就输出中文（绘图模型听得懂中文，理解力也够），
+   不要为了显得专业而翻成英文、不要堆砌术语。
+5. **宁短勿长**：只写真正要在画面上出现的东西。提示词越长各要素互相稀释，出图反而更糊。
 
 原始提示词：
 {prompt}
@@ -1184,6 +1187,11 @@ const DEFAULT_AGENT_INSTRUCTIONS = `你是 QQ 群里的绘图助手。用户发�
 6. 流程结束后用中文回一句简短的结果说明（不要复述 prompt，不要写小作文，不要再问「还要我做什么」）。
 7. 图片编号：gallery_search 结果里的 id、用户发的图（user1、user2…）、指令默认图（cmd1…）都可以直接写进 draw 的 references。
    只填你确认存在的编号，**绝对不要编造 id**。
+8. 【prompt 要短，要说人话】**不要**把用户的话扩写成几百字的「专业」提示词：
+   - 用户用中文提的需求，prompt 就写中文（绘图模型听得懂中文，理解力也够用）；
+   - 别为了显得专业就去堆风格 / 材质 / 光线 / 镜头术语，更别刻意翻成英文；
+   - 只保留用户真正说过的内容 + 画面必须有的要素，**不要替他脑补细节**；
+   - 提示词越长，各要素互相稀释，出图反而越走样。一两句话能把画面说清就够了。
 
 如果你所在的接口不支持函数调用，就**只输出一行 JSON** 来调用工具，例如：
 {"tool":"gallery_search","args":{"keyword":"白发 立绘"}}
@@ -1761,10 +1769,11 @@ export const Config: Schema = Schema.intersect([
   Schema.object({
     appendUserInput: Schema.boolean().default(true).description('把用户随指令发的附加需求并入绘图提示词（例如「手办化 xxx 在偷吃白饭被发现的表情」）'),
     promptOptimize: Schema.union([
-      Schema.const('rewrite').description('融合重写（推荐）：让模型把需求写进提示词对应位置'),
-      Schema.const('merge').description('直接追加：把需求贴在原始提示词末尾'),
-      Schema.const('off').description('不处理：只用指令自身的提示词')
-    ]).default('rewrite').description('用户附加需求如何并入提示词'),
+      Schema.const('passthrough').description('原话直出（推荐）：用户说了就用用户的原话，不再拼接指令自带的提示词，也不做扩写'),
+      Schema.const('merge').description('追加：把用户的原话贴在指令自带提示词后面'),
+      Schema.const('rewrite').description('融合重写：让模型把需求写进提示词对应位置（会变长，老版本的默认行为）'),
+      Schema.const('off').description('不处理：只用指令自带的提示词，忽略用户说的话')
+    ]).default('passthrough').description('用户附加需求如何并入提示词。**绘图模型听得懂中文**，一般不需要再优化/翻译'),
     optimizePrompt: Schema.string().role('textarea', { rows: [10, 6] }).default(DEFAULT_OPTIMIZE_PROMPT).description('融合重写用的提示词模板，占位符：{prompt} 原始提示词、{userInput} 用户附加需求'),
     showPrompt: Schema.boolean().default(true).description('发送优化后的提示词（QQ / QQ 频道用代码块包裹，其它平台发纯文本）'),
     promptMaxLength: Schema.number().default(4000).min(0).max(20000).step(100).description('回显提示词的最大字符数，超出部分截断并标注；设为 0 表示不截断（QQ markdown 有长度上限，太长可能被拒收）'),
@@ -2541,22 +2550,30 @@ export function apply(ctx: Context, config: CommandConfig) {
     ) {
       const waitTimeout = cmdConfig.waitTimeout || config.defaultWaitTimeout
       const maxImages = cmdConfig.maxImages || 0
-      let promptText = cmdConfig.prompt
+      const basePrompt = cmdConfig.prompt || ''
+      const input = String(userInputText || '').trim()
+      const mode = config.promptOptimize || 'passthrough'
+      const takeInput = input && config.appendUserInput !== false
+      // 绘图模型听得懂中文，默认做的是「减法」：用户说了就用他的原话，
+      // 不拼指令自带的长提示词、不扩写、不翻译。
+      let promptText = mode === 'passthrough' ? ((takeInput ? input : '') || basePrompt) : basePrompt
       let optimizeFailed = false
 
-      if (userInputText && config.appendUserInput !== false) {
-        promptText = mergePrompt(promptText, userInputText, true)
-        logInfo(`已并入用户附加需求: ${userInputText}`)
-        if (config.promptOptimize === 'rewrite') {
-          const optimized = await optimizePromptText(cmdConfig.prompt, userInputText)
-          if (optimized) {
-            promptText = optimized
-            logInfo('提示词已融合重写')
-          } else {
-            ctx.logger.warn('提示词融合重写失败，保留追加后的提示词')
-            optimizeFailed = true
-          }
+      if (takeInput && mode === 'merge') {
+        promptText = mergePrompt(basePrompt, input, true)
+        logInfo(`已把用户原话追加到指令提示词后: ${input}`)
+      } else if (takeInput && mode === 'rewrite') {
+        const optimized = await optimizePromptText(basePrompt, input)
+        if (optimized) {
+          promptText = optimized
+          logInfo('提示词已融合重写')
+        } else {
+          ctx.logger.warn('提示词融合重写失败，改用用户的原话')
+          promptText = mergePrompt(basePrompt, input, true)
+          optimizeFailed = true
         }
+      } else if (takeInput && mode !== 'off') {
+        logInfo(`已并入用户原话（${mode} 模式）: ${input}`)
       }
 
       // 自定义指令：本身没提示词、用户也没给文本 -> 要一句
@@ -2570,9 +2587,7 @@ export function apply(ctx: Context, config: CommandConfig) {
         }
         if (!userPrompt) return session.text('image-prompt.messages.needprompt')
         const text = extractTextFromMessage(userPrompt) || String(userPrompt).trim()
-        promptText = config.promptOptimize === 'rewrite'
-          ? ((await optimizePromptText('', text)) || text)
-          : mergePrompt('', text, true)
+        promptText = (mode === 'rewrite' && (await optimizePromptText('', text))) || text
       }
 
       const images: string[] = [...(defaultImageUrls || []), ...extractImagesFromSession(session)]
