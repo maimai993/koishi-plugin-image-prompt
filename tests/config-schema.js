@@ -1,5 +1,5 @@
 /**
- * 配置 Schema 回归测试：确认新增开关的默认值、以及指令级覆盖真的生效。
+ * 配置 Schema 回归测试：确认 agent 相关开关的默认值、以及指令级覆盖真的生效。
  *
  * 端到端探针是直接 `plugin.apply(shim, config)` 的，**绕过了 Koishi 的 Schema 校验** ——
  * Schema 写错（例如用了 `Schema.const(undefined)` 表达「跟随」）在那里看不出来，
@@ -46,31 +46,66 @@ check('Config 能被 Schema 解析', () => {
   assert.ok(list.every(part => typeof part === 'function'), '每段都应该是可调用的 Schema')
 })
 
-check('新开关默认值正确', () => {
+check('★ Agent 默认开启，且开画前确认默认开', () => {
   const cfg = build({})
-  assert.strictEqual(cfg.ackOnStart, true, '收到提示默认开')
-  assert.strictEqual(cfg.confirmBeforeDraw, true, '开画前确认默认开')
-  assert.strictEqual(cfg.confirmTimeout, 60)
-  assert.strictEqual(cfg.aiSelector.visionMaxImageBytes, 4)
+  assert.strictEqual(cfg.agent.enabled, true, 'agent 默认开')
+  assert.strictEqual(cfg.agent.confirmBeforeDraw, true, '开画前确认默认开')
 })
 
-check('★ 指令级「开画前确认」三态：默认跟随全局', () => {
+check('★ Agent 各项默认值合理', () => {
   const cfg = build({})
-  assert.strictEqual(cfg.nested.commands[0].confirmBeforeDraw, 'follow')
+  assert.strictEqual(cfg.agent.maxIterations, 8)
+  assert.strictEqual(cfg.agent.maxSelect, 3)
+  assert.strictEqual(cfg.agent.searchLimit, 12)
+  assert.strictEqual(cfg.agent.askTimeout, 120)
+  assert.strictEqual(cfg.agent.timeout, 120)
+  assert.strictEqual(cfg.agent.maxTokens, 8000)
+  assert.strictEqual(cfg.agent.historyTurns, 6)
+  assert.strictEqual(cfg.agent.debugLog, false)
+})
+
+check('★ Agent 指令模板：说了三个工具 + 带开画确认占位符', () => {
+  const cfg = build({})
+  const t = cfg.agent.instructions
+  assert.ok(t.includes('{confirmRule}'), '应带开画确认占位符')
+  assert.ok(/gallery_search/.test(t) && /ask_user/.test(t) && /draw/.test(t), '应说明三个工具')
+  assert.ok(/一次只问一个/.test(t), '应要求一次只问一个问题（防模型连珠炮）')
+  assert.ok(/不要编造|绝对不要编造/.test(t), '应禁止编造图片编号')
+})
+
+check('★ 旧选图相关配置项已经彻底删掉（不再出现在解析结果里）', () => {
+  const cfg = build({})
+  for (const key of ['selectionMode', 'minScore', 'analyzePrompt', 'scorePrompt', 'keywordPrompt', 'twoStage', 'vision', 'maxSelect']) {
+    assert.ok(!(key in cfg.aiSelector), `aiSelector 不该再有 ${key}`)
+  }
+  assert.ok(!('confirmBeforeDraw' in cfg) || typeof cfg.confirmBeforeDraw === 'undefined', '顶层不该再有 confirmBeforeDraw')
+  assert.ok(!('confirmTimeout' in cfg), '顶层不该再有 confirmTimeout')
+  assert.ok(!('mergeNotifications' in cfg), '顶层不该再有 mergeNotifications')
+})
+
+check('★ 指令级「走不走 agent」三态：默认跟随全局', () => {
+  const cfg = build({})
+  assert.strictEqual(cfg.nested.commands[0].agent, 'follow')
 })
 
 check('★ 指令级可以覆盖成 on / off', () => {
-  const off = build({ nested: { commands: [{ name: 'x', prompt: '', confirmBeforeDraw: 'off' }] } })
-  assert.strictEqual(off.nested.commands[0].confirmBeforeDraw, 'off')
-  const on = build({ nested: { commands: [{ name: 'y', prompt: '', confirmBeforeDraw: 'on' }] } })
-  assert.strictEqual(on.nested.commands[0].confirmBeforeDraw, 'on')
+  const off = build({ nested: { commands: [{ name: 'x', prompt: '', agent: 'off' }] } })
+  assert.strictEqual(off.nested.commands[0].agent, 'off')
+  const on = build({ nested: { commands: [{ name: 'y', prompt: '', agent: 'on' }] } })
+  assert.strictEqual(on.nested.commands[0].agent, 'on')
+})
+
+check('★ 老配置里残留的 aiSelect / aiMaxSelect / confirmBeforeDraw 不会把解析搞崩', () => {
+  const cfg = build({
+    nested: { commands: [{ name: 'z', prompt: '', aiSelect: true, aiMaxSelect: 2, aiAskUser: true, confirmBeforeDraw: 'off' }] },
+  })
+  assert.strictEqual(cfg.nested.commands[0].name, 'z')
+  assert.strictEqual(cfg.nested.commands[0].agent, 'follow', '新字段仍走默认值')
 })
 
 check('顶层开关可以被覆盖', () => {
-  const cfg = build({ ackOnStart: false, confirmBeforeDraw: false, confirmTimeout: 30 })
-  assert.strictEqual(cfg.ackOnStart, false)
-  assert.strictEqual(cfg.confirmBeforeDraw, false)
-  assert.strictEqual(cfg.confirmTimeout, 30)
+  const cfg = build({ agent: { enabled: false } })
+  assert.strictEqual(cfg.agent.enabled, false)
 })
 
 check('默认指令列表仍然带全套字段（老配置不至于因为新字段炸掉）', () => {
@@ -81,11 +116,12 @@ check('默认指令列表仍然带全套字段（老配置不至于因为新字�
   }
 })
 
-check('新开关都是布尔/数字，没混进字符串哨兵', () => {
+check('★ 新开关都是布尔/数字，没混进字符串哨兵', () => {
   const cfg = build({})
+  assert.strictEqual(typeof cfg.agent.enabled, 'boolean')
+  assert.strictEqual(typeof cfg.agent.confirmBeforeDraw, 'boolean')
+  assert.strictEqual(typeof cfg.agent.maxIterations, 'number')
   assert.strictEqual(typeof cfg.ackOnStart, 'boolean')
-  assert.strictEqual(typeof cfg.confirmBeforeDraw, 'boolean')
-  assert.strictEqual(typeof cfg.confirmTimeout, 'number')
 })
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)

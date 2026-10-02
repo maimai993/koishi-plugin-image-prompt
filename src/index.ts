@@ -25,37 +25,44 @@ export const usage = `
 - 使用的模型（model）
 - API 密钥（apiKey）
 
-【AI 选择参考图片】
+【Agent 模式（默认，推荐）】
 
-1. 在「参考图片组」中注册分组：每组填写若干张「图片链接 + 描述」（描述用于让 AI 判断该图的用途）。
-   **描述一定要写具体**（发色发型、服装、动作、画风）—— 打分制下没描述的图永远选不上。
-2. 在指令配置的「引用的参考图片组名称」中填入组名（可填多个），该指令执行时会把组内图片全部交给 AI 挑选。
-3. 「AI 选图设置」可修改对话模型（默认 Qwen/Qwen2.5-7B-Instruct）、选择模式、提示词模板、超时与重试等；
-   接口地址/密钥留空时复用绘图接口的配置。
-4. 「选图模式」默认是**打分制**：先只做需求分析（**不给模型候选图**，它没有「可挑的对象」），
-   再用关键词在本地召回，然后要求模型给每张候选图打 0-100 分，低于「最低分数线」的一律不要。
-   一张都不达标就如实告知用户「图库里没有合适的参考图」，**不会硬凑**；
-   若开启「缺少合适参考图时询问用户补充发送」，会请用户补发一张参考图（用户发的图会被直接使用）。
-   想回到老行为就把「选图模式」改成「旧版」。
-5. 当用户明确说「不用参考 / 随意画 / 自由发挥」时，直接跳过选图，一次选图请求都不发。
-6. 指令一触发就先回一条「收到，正在准备...」（「消息发送 → 收到提示」，默认开）。
-   后面的优化提示词 + 选图是两轮模型请求，可能要几十秒，不发这条用户会以为机器人卡死。
-7. **开画前确认**（「消息发送 → 开画前请用户确认」，默认开）：AI 挑完参考图先不画，
-   把「本次会参考哪几张图」列出来，回复「确认」才开画（超时或回别的都算取消）。
-   不想多这一步就关掉，或在单个指令上设成「选好图直接开画」。
-8. 「启用 AI 智能选择参考图片」默认关闭，需手动开启；「AI 选图失败时回退为使用候选池内全部图片」默认关闭，
-   失败时本次不使用参考图片（开启则改用候选池内全部图片）。注意「回退」只对**请求失败**生效，
-   对「打分不达标」不生效 —— 后者就该不带参考图。
-9. 「旧版」模式下参考图较多时（超过 12 张）自动走两级检索：先让模型产出检索关键词、本地匹配召回，
-   再对召回结果精排；识图模式下也只发送召回的这几张图片，避免每次都把整个图库发给模型。
-10. 描述可以用「生成描述」指令让模型看图自动生成并写回配置（需要支持图片输入的模型）。
-   若选图模型支持识别图片（多模态），可勾选「选图模型支持识别图片」，插件会把候选图片**自己下载后转 base64**
-   再发给模型（直接丢链接的话，模型服务端拉不到就会整条请求 400），模型对着真实图片挑选；
-   它给出的关键视觉特征还会并入绘图提示词，让出图更还原参考图。
-11. 生成结果可自动入库（默认关闭），下次能被自己检索到并复用，形成闭环；
-   开启「后台绘图」后出图不再阻塞，先回「正在画」，画好主动推送。
+指令一触发，插件就把「用户说了什么 + 指令提示词 + 可用的参考图」全部交给**对话模型**，
+由模型自己决定下一步 —— 跟 NeoBot 一个套路：
 
-提示词模板可用占位符：{candidates} 候选图片列表、{userInput} 用户附加需求、{max} 最多选择数量、{command} 指令名、{prompt} 指令提示词
+- **gallery_search**：模型自己按关键词搜参考图库（关键词由它自己拟，不用你在配置里写规则）
+- **ask_user**：问题不清楚、缺参考图、开画前要确认，模型自己开口问，并等用户回话
+- **draw**：把 prompt 和它挑中的参考图编号交出去，真正开始画
+
+也就是说：**参考图选谁、要不要追问、什么时候开画，全部是模型自己决定的**，
+插件不再写死「打分 → 阈值 → 不够就问用户」这套流程。
+模型想搜几次图库、想和用户来回几轮都行，直到它认为可以画了。
+
+要求：填写的对话模型必须**支持 function calling（工具调用）**。
+不支持也没关系 —— 插件内置了「只用一行 JSON 调用工具」的兜底协议，模型照样能跑流程。
+
+相关开关：
+- 「启用 Agent 模式」默认开。关掉就退化成「指令提示词 + 用户附加需求直接画」，不查图库也不追问。
+- 「开画前先问一句」默认开：模型画之前会先用 ask_user 把「本次参考哪几张图 + 大致画面」告诉你，你点头它才画。
+- 「最多参考图数量」「单次搜索返回条数」「询问等待时间」「最多来回轮数」都在 agent 配置里调。
+
+【参考图片组 / 图库】
+
+1. 在「参考图片组」里注册分组：每组填「图片链接 + 描述」。**描述要写具体**（发色发型、服装、动作、画风），
+   模型就是靠这句描述搜到它的。
+2. 在指令配置的「引用的参考图片组名称」里填组名（可多个）；模型只会在这个范围内搜。
+   留空且开启「允许搜索全部组」时，所有组都能搜到。
+3. 「生成描述」指令可以让模型看图自动写描述并写回配置（需要支持图片输入的模型）。
+4. 生成结果可自动入库（默认关闭），下次能被自己搜到并复用，形成闭环。
+
+【其它】
+
+- 「收到提示」默认开：指令触发立刻回一条「收到，正在准备...」，不让用户以为卡住。
+- 「后台绘图」开启后出图不阻塞，先回「正在画」，画好主动推送。
+- 「文字渲染参考图」把画面上的文字（台词/招牌）先渲染成图片一起发给绘图模型，解决中文崩字。
+- 回显提示词、结果图尺寸/走 assets 等都在「消息发送」里。
+
+Agent 指令模板可用占位符：{command} 指令名、{prompt} 指令提示词、{userInput} 用户附加需求、{imageCount} 用户随消息发的图数量、{refCount} 可检索的参考图数量
 
 ---
 此项目所需的koishi服务：必需 'http', 'logger', 'i18n'；可选 'puppeteer'（仅「文字渲染参考图」需要）
@@ -64,84 +71,6 @@ export const usage = `
 `;
 
 const logger = new Logger(name)
-
-/**
- * 解析模型返回的 JSON 选择结果（纯函数，便于单独测试）
- * @param raw 模型的原始回复
- * @param candidates 候选图片列表（编号从 1 开始）
- * @param max 最多选取数量
- * @param warn 日志回调
- */
-export function parseSelectionResult(
-  raw: string | null,
-  candidates: CandidateImage[],
-  max: number,
-  warn: (msg: string) => void = () => {}
-): SelectionResult {
-  const result: SelectionResult = { picked: [], needUserImage: false, askMessage: '', reason: '', ok: false }
-  if (!raw) return result
-
-  let text = raw.trim()
-  const codeMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/)
-  if (codeMatch) text = codeMatch[1].trim()
-
-  const start = text.indexOf('{')
-  const end = text.lastIndexOf('}')
-  if (start === -1 || end <= start) return result
-
-  let data: any
-  try {
-    data = JSON.parse(text.slice(start, end + 1))
-  } catch (error) {
-    warn(`AI 选图返回内容无法解析为 JSON: ${text.slice(0, 200)}`)
-    return result
-  }
-
-  result.ok = true
-  result.reason = String(data.reason || data.reasoning || '')
-  result.needUserImage = data.needUserImage === true || data.need_user_image === true
-  result.askMessage = String(data.askMessage || data.ask_message || '')
-  result.hint = String(data.hint || data.observation || data.description || '').trim() || undefined
-
-  // 模型认为画面上要出现的文字（台词/标题/字幕），交给浏览器渲染成参考图
-  const rawText = data.text ?? data.texts ?? data.dialogue ?? data.renderText ?? data.lines ?? data.caption
-  if (Array.isArray(rawText)) {
-    result.renderText = rawText.map(line => String(line).trim()).filter(Boolean).join('\n')
-  } else if (typeof rawText === 'string' && rawText.trim()) {
-    result.renderText = rawText.trim()
-  }
-
-  const rawKeywords = data.keywords ?? data.query ?? data.queries
-  if (Array.isArray(rawKeywords)) {
-    result.keywords = rawKeywords.map(k => String(k).trim()).filter(Boolean)
-  } else if (typeof rawKeywords === 'string' && rawKeywords.trim()) {
-    result.keywords = rawKeywords.split(/[,，\n]+/).map(k => k.trim()).filter(Boolean)
-  }
-
-  // 兼容多种返回写法：数组 / 逗号分隔字符串 / 单个数字 / 0-based
-  // 兼容多种写法：selected（精排）/ candidates（两级检索的粗筛）/ picked / indexes / index
-  const rawSelected = data.selected ?? data.candidates ?? data.picked ?? data.indexes ?? data.index
-  const indexes: number[] = []
-  const pushIndex = (value: any) => {
-    const num = typeof value === 'number' ? value : parseInt(String(value).replace(/[^0-9-]/g, ''), 10)
-    if (!isNaN(num)) indexes.push(num)
-  }
-  if (Array.isArray(rawSelected)) {
-    rawSelected.forEach(pushIndex)
-  } else if (typeof rawSelected === 'string') {
-    rawSelected.split(/[,，\s]+/).forEach(pushIndex)
-  } else if (typeof rawSelected === 'number') {
-    pushIndex(rawSelected)
-  }
-
-  for (const index of indexes) {
-    const candidate = candidates[index - 1] || candidates[index]
-    if (candidate && !result.picked.includes(candidate)) result.picked.push(candidate)
-    if (result.picked.length >= max) break
-  }
-
-  return result
-}
 
 /**
  * 计算重试等待时间（毫秒）：限流类错误优先用 Retry-After，否则指数退避
@@ -158,103 +87,6 @@ export function computeRetryDelay(status: any, retryAfter: number | undefined, b
   }
   return base
 }
-
-/**
- * 第一级检索：按关键词在候选池里做文本匹配召回（纯本地，不发请求）
- * 支持中文子串匹配 + 2-gram 部分命中，关键词可含空格/顿号（会自动拆分）
- */
-export function matchCandidatesByKeywords(candidates: CandidateImage[], keywords: string[], topK: number): CandidateImage[] {
-  const words = (keywords || [])
-    .flatMap(k => String(k).split(/[\s,，、;；/|]+/))
-    .map(w => normalizeText(w))
-    .filter(w => w.length > 0)
-
-  if (!words.length) return []
-
-  const scored: { item: CandidateImage, score: number }[] = []
-  for (const candidate of candidates) {
-    const haystack = normalizeText(`${candidate.group} ${candidate.description}`)
-    let score = 0
-    for (const word of words) {
-      if (haystack.includes(word)) {
-        score += Math.max(2, word.length) * 2
-      } else if (word.length > 2) {
-        // 部分命中：拆成 2-gram 再看
-        for (const gram of toGrams(word)) {
-          if (haystack.includes(gram)) score += 1
-        }
-      }
-    }
-    if (score > 0) scored.push({ item: candidate, score })
-  }
-
-  scored.sort((a, b) => b.score - a.score)
-  return scored.slice(0, topK > 0 ? topK : 12).map(s => s.item)
-}
-
-function normalizeText(value: string): string {
-  return String(value || '').toLowerCase().replace(/\s+/g, '')
-}
-
-function toGrams(word: string): string[] {
-  const grams: string[] = []
-  for (let i = 0; i < word.length - 1; i++) grams.push(word.slice(i, i + 2))
-  return grams
-}
-
-/** 去重合并候选（按 url 判重） */
-export function mergeCandidates(...lists: CandidateImage[][]): CandidateImage[] {
-  const seen = new Set<string>()
-  const result: CandidateImage[] = []
-  for (const list of lists) {
-    for (const item of list || []) {
-      if (!item || !item.url || seen.has(item.url)) continue
-      seen.add(item.url)
-      result.push(item)
-    }
-  }
-  return result
-}
-
-// ============================================================================
-// AI 选图：需求抽取 → 关键词召回 → 逐图打分 → 阈值兜底
-// 思路来自 NeoBot 的「先检索再引用」：模型不直接面对一堆候选去「挑」，
-// 而是先把「要什么」想清楚，再对召回的少数图逐张显式打分；
-// 分数不达标就如实回「图库没有合适的图」，而不是硬挑一张凑数。
-// ============================================================================
-
-/** 选图第一步的产物：先想清楚「要什么」，再去看「有什么」 */
-export interface RequirementAnalysis {
-  /** 画面主体（一句话） */
-  subject: string
-  /** 硬性要素：缺一个就不该选这张图 */
-  must: string[]
-  /** 加分要素：有更好，没有也能用 */
-  nice: string[]
-  /** 明确不要出现的 */
-  avoid: string[]
-  /** 画面需要出现的文字（台词/标题/招牌），交给浏览器渲染 */
-  text: string
-  /** 用户表示「不用参考/随意画」时跳过检索 */
-  skipReference: boolean
-  /** 判定需要用户补图时，用一句话说明要什么样的图 */
-  needTypes: string
-}
-
-/** 单张候选图的打分结果（index 从 1 开始，对应候选列表位置） */
-export interface ScoredCandidate {
-  index: number
-  score: number
-  why: string
-}
-
-/** 用户明确表示不需要参考图（回退到纯文生图） */
-const SKIP_REFERENCE_RE = new RegExp([
-  '(不用|不需要|无需|不要|别)(参考|垫图|看图|找图|搜图|调图库)',
-  '(参考图|垫图|图库)(不用|不需要|就别|去掉)',
-  '(随意|随便|自由|任意)发挥',
-  '随意画|随便画|你看着画|看着办|你决定',
-].join('|'))
 
 /** 从任意文本里挖出第一个 JSON 对象（容忍代码块围栏和前后废话） */
 export function extractJsonObject(raw: string | null | undefined): any | null {
@@ -273,175 +105,248 @@ export function extractJsonObject(raw: string | null | undefined): any | null {
   }
 }
 
-/** 把模型给的字段统一成字符串数组（支持数组 / 逗号顿号换行分隔的字符串） */
-export function toStrList(value: any): string[] {
-  if (Array.isArray(value)) return value.map(v => String(v ?? '').trim()).filter(Boolean)
-  if (typeof value === 'string' && value.trim()) {
-    return value.split(/[,，、;；\n]+/).map(s => s.trim()).filter(Boolean)
-  }
-  return []
+// ============================================================================
+// Agent 相关纯函数（便于单独测试）
+// ============================================================================
+
+/** 归一化文本用于匹配：小写 + 去空白 */
+function normText(value: string): string {
+  return String(value || '').toLowerCase().replace(/\s+/g, '')
 }
 
-/** 用户这句话是不是「不用参考了」 */
-export function isSkipReferenceInput(userInput: string): boolean {
-  const text = String(userInput || '').trim()
-  if (!text) return false
-  return SKIP_REFERENCE_RE.test(text)
+/** 拆 2-gram，用于中文关键词的部分命中 */
+function bigrams(word: string): string[] {
+  const grams: string[] = []
+  for (let i = 0; i < word.length - 1; i++) grams.push(word.slice(i, i + 2))
+  return grams
 }
 
 /**
- * 兜住「需求分析」模型爱乱加的废话。
- *
- * 实测模型会把 needTypes 写成
- * 「能发一张你想用的自己形象的参考图吗？顺便说说 DeepSeek 画成鲸鱼可以吗？」——
- * 后半句是凭空瞎聊，用户看了莫名其妙。这里只保留第一句、去掉换行和 markdown 修饰、
- * 限制长度，把「询问补图」这件事还原成一句话。
+ * gallery_search 工具的检索实现：关键词由**模型**自己拟，这里只做文本匹配排序。
+ * 多关键词空格分隔，全部命中的排最前（参考 NeoBot 的 gallery_search）。
  */
-export function sanitizeAskMessage(raw: string | null | undefined, max = 40): string {
-  let text = String(raw ?? '').replace(/\s+/g, ' ').trim()
+export function searchGallery(items: CandidateImage[], keyword: string, limit: number): CandidateImage[] {
+  const words = String(keyword || '')
+    .split(/[\s,，、;；/|]+/)
+    .map(w => normText(w))
+    .filter(w => w.length > 0)
+
+  if (!words.length) return (items || []).slice(0, limit > 0 ? limit : 12)
+
+  const scored: { item: CandidateImage, score: number }[] = []
+  for (const item of items || []) {
+    const haystack = normText(`${item.group} ${item.description}`)
+    let score = 0
+    for (const word of words) {
+      if (haystack.includes(word)) score += Math.max(2, word.length) * 2
+      else if (word.length > 2) {
+        for (const gram of bigrams(word)) if (haystack.includes(gram)) score += 1
+      }
+    }
+    if (score > 0) scored.push({ item, score })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  return scored.slice(0, limit > 0 ? limit : 12).map(s => s.item)
+}
+
+/**
+ * 把模型给的 references 解析成登记表里的编号。
+ * 兼容 `ref3` / `gallery:ref3` / 裸编号 `3` / `url:https://...` / 直接写链接。
+ * 认不出来的进 unknown，让模型知道它编了个不存在的 id。
+ */
+export function resolveReferences(
+  refs: any[],
+  registry: Map<string, { url: string }>
+): { ids: string[], unknown: string[] } {
+  const ids: string[] = []
+  const unknown: string[] = []
+  for (const raw of refs || []) {
+    const token = String(raw ?? '').trim()
+    if (!token) continue
+
+    let candidate = token
+    const prefixed = token.match(/^(?:gallery|ref|image|img|url|file|chat)\s*[:：]\s*(.+)$/i)
+    if (prefixed) candidate = prefixed[1].trim()
+
+    if (/^https?:\/\//i.test(candidate)) {
+      let hit: string | undefined
+      registry.forEach((entry, id) => { if (!hit && entry.url === candidate) hit = id })
+      if (hit) { if (!ids.includes(hit)) ids.push(hit) }
+      else unknown.push(token)
+      continue
+    }
+    if (registry.has(candidate)) {
+      if (!ids.includes(candidate)) ids.push(candidate)
+      continue
+    }
+    const numeric = candidate.match(/^(\d+)$/)
+    if (numeric) {
+      const id = `ref${numeric[1]}`
+      if (registry.has(id)) {
+        if (!ids.includes(id)) ids.push(id)
+        continue
+      }
+    }
+    unknown.push(token)
+  }
+  return { ids, unknown }
+}
+
+/** agent 可用的工具名（JSON 兜底协议只对这几个名字生效，避免把正常回复当工具调用） */
+export const AGENT_TOOL_NAMES = ['gallery_search', 'ask_user', 'draw']
+
+/** OpenAI function-calling 格式的工具定义 */
+export function buildAgentTools(): any[] {
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'gallery_search',
+        description: '按关键词搜索参考图库。多个关键词用空格分隔（如「白发 立绘」），全部命中的排在最前；关键词留空则浏览前若干张。返回的 id 写进 draw 的 references 即可作为参考图。',
+        parameters: {
+          type: 'object',
+          properties: {
+            keyword: { type: 'string', description: '搜索关键词，写图片描述里会出现的词（角色名、发色发型、服装、画风）' },
+            limit: { type: 'integer', description: '最多返回多少条，不填用默认' },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'ask_user',
+        description: '把一句话发给用户并等待他的下一条消息（他发的图片也会一起带回来）。信息缺失、开画前确认都用它。一次只问一个最关键的问题。',
+        parameters: {
+          type: 'object',
+          properties: {
+            question: { type: 'string', description: '要问用户的话（中文，面向用户，一句话）' },
+          },
+          required: ['question'],
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'draw',
+        description: '开始绘图。把最终提示词与要参考的图片编号交进来，画好会自动发到群里。涉及角色时记得把 gallery_search 找到的 id 写进 references。',
+        parameters: {
+          type: 'object',
+          properties: {
+            prompt: { type: 'string', description: '完整的绘图提示词（英文效果更稳；画面上必须出现的文字要原样写进去）' },
+            references: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '参考图编号数组，如 ["ref3","ref7"]；也可以直接写图片链接',
+            },
+            negative_prompt: { type: 'string', description: '可选，不希望画面出现的内容' },
+          },
+          required: ['prompt'],
+        },
+      },
+    },
+  ]
+}
+
+/**
+ * 从模型返回里取出助手消息，以及它想调用的工具。
+ * 兼容：原生 tool_calls、老式 function_call、中转站把正文塞进奇怪字段。
+ */
+export function pickAgentMessage(response: any): {
+  message: any
+  content: string
+  toolCalls: { id?: string, name: string, args: any }[]
+} {
+  const choice = response?.choices?.[0]
+  const message = choice?.message || choice?.delta || {}
+
+  let content = typeof message.content === 'string' ? message.content : ''
+  if (!content && typeof message.reasoning_content === 'string') content = message.reasoning_content
+  if (!content) {
+    const { text } = extractResponseText(response)
+    content = text || ''
+  }
+
+  const toolCalls: { id?: string, name: string, args: any }[] = []
+  const raw = Array.isArray(message.tool_calls) ? message.tool_calls : []
+  for (const call of raw) {
+    const name = call?.function?.name || call?.name
+    if (!name) continue
+    let args: any = {}
+    const rawArgs = call?.function?.arguments ?? call?.arguments ?? call?.input
+    if (typeof rawArgs === 'string') {
+      try { args = rawArgs.trim() ? JSON.parse(rawArgs) : {} } catch { args = {} }
+    } else if (rawArgs && typeof rawArgs === 'object') {
+      args = rawArgs
+    }
+    toolCalls.push({ id: call?.id, name, args })
+  }
+
+  // 老式 function_call（部分中转站只支持这种）
+  if (!toolCalls.length && message.function_call?.name) {
+    let args: any = {}
+    try { args = JSON.parse(message.function_call.arguments || '{}') } catch { args = {} }
+    toolCalls.push({ id: undefined, name: message.function_call.name, args })
+  }
+
+  return {
+    message: { role: 'assistant', content, tool_calls: raw.length ? raw : undefined },
+    content,
+    toolCalls,
+  }
+}
+
+/**
+ * 「一行 JSON」兜底协议：模型所在接口不支持 function calling 时，
+ * 它只要输出 {"tool":"draw","args":{...}} 我们照样能执行。
+ * 只有 tool 名字命中 AGENT_TOOL_NAMES 才当工具调用，避免把正常回复误判。
+ */
+export function parseJsonToolCall(content: string, names: string[] = AGENT_TOOL_NAMES): { id?: string, name: string, args: any }[] {
+  const data = extractJsonObject(content)
+  if (!data) return []
+  const name = String(data.tool ?? data.name ?? data.function ?? '').trim()
+  if (!name || !names.includes(name)) return []
+  const args = data.args ?? data.arguments ?? data.parameters ?? data.input
+  return [{ name, args: (args && typeof args === 'object') ? args : {} }]
+}
+
+/** 渲染 agent 指令模板：把 {xxx} 占位符换成实际值 */
+export function renderAgentInstructions(template: string, vars: Record<string, string | number>): string {
+  return String(template || '').replace(/\{(\w+)\}/g, (_match, key) => String(vars?.[key] ?? ''))
+}
+
+/**
+ * 洗一下 ask_user 的提问文案。
+ * 模型偶尔会在问句后面顺带聊别的（实测出现过「能发一张参考图吗？顺便说说 XX 可以吗？」），
+ * 这里压成一行、去掉 markdown 记号和包裹引号、限长，让它永远是「对用户说的一句话」。
+ */
+export function cleanAskMessage(raw: any, max = 200): string {
+  let text = String(raw ?? '')
+    .replace(/\r/g, ' ')
+    .replace(/\n+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
   if (!text) return ''
-  // 只留第一句：句末标点（中文/英文）之后的内容全部丢掉
-  const first = text.match(/^[^。！？!?；;]*[。！？!?；;]?/)
-  if (first) text = first[0].trim()
-  // 去掉 markdown 记号与包裹引号
-  text = text.replace(/^[-*>#\s]+/, '').replace(/^["'“”「」『』]+/, '').replace(/["'“”「」『』]+$/, '').trim()
+
+  // 模型给的可能长这样：- **问题：**"想要什么画风？"
+  // 一层层剥，直到剥不动为止（markdown 记号、引号、「问题：」标签可以任意组合）
+  for (let i = 0; i < 3; i++) {
+    const next = text
+      .replace(/^[-*>#\s]+/, '')
+      .replace(/^\*{1,3}/, '')
+      .replace(/^_{1,3}/, '')
+      .replace(/^["'“”「」『』]+/, '')
+      .replace(/^\s*(问题|提问|question)\s*[:：]\s*/i, '')
+      .trim()
+    if (next === text) break
+    text = next
+  }
+  text = text.replace(/["'“”「」『』]+$/, '').replace(/\*{1,3}$/, '').trim()
+
   if (text.length > max) text = text.slice(0, max) + '…'
   return text
-}
-
-/** 确认绘图的回复：只认「就是这一句」的短回复，避免把正常聊天当确认 */
-const CONFIRM_RE = /^(确认|确定|可以|好的|好|行|嗯|是|是的|开始|开画|画吧|继续|ok|okay|yes|y|1|\+1)$/i
-
-export function isConfirmInput(raw: string | null | undefined): boolean {
-  const text = String(raw ?? '')
-    .replace(/[\s\u3000]+/g, '')
-    .replace(/[!！。.,，~～?？:：]+$/g, '')
-  if (!text || text.length > 12) return false
-  return CONFIRM_RE.test(text)
-}
-
-/** 解析「需求抽取」的返回 */
-export function parseAnalysisResult(raw: string | null): RequirementAnalysis | null {
-  const data = extractJsonObject(raw)
-  if (!data) return null
-  const text = data.text ?? data.texts ?? data.lines ?? data.renderText
-  return {
-    subject: String(data.subject ?? data.主体 ?? '').trim(),
-    must: toStrList(data.must ?? data.mustHave ?? data.required ?? data.硬性要素),
-    nice: toStrList(data.nice ?? data.niceToHave ?? data.optional ?? data.加分要素),
-    avoid: toStrList(data.avoid ?? data.exclude ?? data.negative ?? data.不要出现),
-    text: Array.isArray(text) ? toStrList(text).join('\n') : String(text ?? '').trim(),
-    skipReference: data.skipReference === true || data.skip_reference === true,
-    needTypes: sanitizeAskMessage(data.needTypes ?? data.need_types ?? data.需要的图 ?? ''),
-  }
-}
-
-/** 把「需求要素」转成本地检索用的关键词 */
-export function keywordsFromAnalysis(analysis: RequirementAnalysis | null): string[] {
-  if (!analysis) return []
-  const words: string[] = []
-  const push = (value: string) => {
-    const item = String(value || '').trim()
-    if (item && !words.includes(item)) words.push(item)
-  }
-  if (analysis.subject) push(analysis.subject)
-  analysis.must.forEach(push)
-  analysis.nice.forEach(push)
-  return words
-}
-
-/** 把分数归一化到 0-100（兼容 0.85 这种小数写法、以及 "85分" 这种字符串） */
-export function normalizeScore(value: any): number | null {
-  if (typeof value === 'number' && isFinite(value)) {
-    const num = value > 0 && value <= 1 ? Math.round(value * 100) : Math.round(value)
-    return Math.max(0, Math.min(100, num))
-  }
-  if (typeof value === 'string') {
-    const matched = value.match(/-?\d+(?:\.\d+)?/)
-    if (!matched) return null
-    return normalizeScore(parseFloat(matched[0]))
-  }
-  return null
-}
-
-/** 解析「逐图打分」的返回 */
-export function parseScoreResult(raw: string | null, candidates: CandidateImage[]): ScoredCandidate[] {
-  const data = extractJsonObject(raw)
-  if (!data) return []
-  const list = data.scores ?? data.score ?? data.items ?? data.results ?? data.评分
-  if (!Array.isArray(list)) return []
-
-  const out: ScoredCandidate[] = []
-  for (const entry of list) {
-    if (!entry || typeof entry !== 'object') continue
-    const rawIndex = entry.index ?? entry.id ?? entry.no ?? entry.n ?? entry.编号
-    const index = rawIndex === undefined ? null : parseInt(String(rawIndex).replace(/[^0-9-]/g, ''), 10)
-    const score = normalizeScore(entry.score ?? entry.points ?? entry.分数 ?? entry.value)
-    if (index === null || isNaN(index) || score === null) continue
-    // 兼容 0-based 写法，统一换算成从 1 开始
-    const candidate = candidates[index - 1] || candidates[index]
-    if (!candidate) continue
-    out.push({ index: candidates.indexOf(candidate) + 1, score, why: String(entry.why ?? entry.reason ?? entry.说明 ?? '').trim() })
-  }
-  return out
-}
-
-/**
- * 按分数阈值筛选：只有达到 minScore 的才留下，按分数从高到低取前 max 张。
- * 一张都不达标时返回空数组 —— 这是「宁可不选也不乱选」的兜底。
- */
-export function selectByScore(
-  scored: ScoredCandidate[],
-  candidates: CandidateImage[],
-  minScore: number,
-  max: number
-): { picked: CandidateImage[], best: number, passed: number } {
-  const threshold = minScore > 0 ? minScore : 0
-  // 同一张图若被打了多次分，取最高的一次
-  const best = new Map<number, ScoredCandidate>()
-  for (const item of scored || []) {
-    const prev = best.get(item.index)
-    if (!prev || item.score > prev.score) best.set(item.index, item)
-  }
-
-  const eligible = [...best.values()]
-    .filter(item => item.score >= threshold)
-    .sort((a, b) => b.score - a.score)
-
-  const limit = max > 0 ? max : 1
-  const picked: CandidateImage[] = []
-  for (const item of eligible) {
-    if (picked.length >= limit) break
-    const candidate = candidates[item.index - 1]
-    if (candidate && !picked.includes(candidate)) picked.push(candidate)
-  }
-
-  return {
-    picked,
-    best: (scored || []).reduce((acc, item) => Math.max(acc, item.score), 0),
-    passed: eligible.length,
-  }
-}
-
-/**
- * 去掉重复图：链接相同的直接去掉；描述完全相同的（同一批入库的近似图）只留第一张。
- */
-export function dedupeCandidates(list: CandidateImage[]): CandidateImage[] {
-  const out: CandidateImage[] = []
-  const seenUrl = new Set<string>()
-  const seenDesc = new Set<string>()
-  for (const item of list || []) {
-    if (!item || !item.url || seenUrl.has(item.url)) continue
-    const desc = normalizeText(item.description || '')
-    // 描述太短（如「无描述」）不参与描述去重，避免误杀
-    if (desc.length >= 6) {
-      if (seenDesc.has(desc)) continue
-      seenDesc.add(desc)
-    }
-    seenUrl.add(item.url)
-    out.push(item)
-  }
-  return out
 }
 
 /**
@@ -925,47 +830,6 @@ export function withTokenParam(body: any, param: string): any {
   return next
 }
 
-/**
- * 构造发给选图模型的 user 消息内容。
- * 未开启识别图片时返回纯文本；开启时按「编号文字 + 图片」交替排列，让模型把编号和图片对上。
- * @param text 提示词正文（含 {candidates} 文本列表）
- * @param candidates 候选图片
- * @param vision 是否附带图片
- * @param visionMaxImages 最多附带多少张图片
- * @param dataUrls 已经自己下载好的 base64 data URL（按 candidates 下标）。**传了它之后，
- *   没下载成功的图就不再发原始链接了** —— 上游拉不到那个链接会整条请求 400，
- *   连文字描述一起废掉；只发描述反而还能用。
- */
-export function buildSelectorContent(
-  text: string,
-  candidates: CandidateImage[],
-  vision: boolean,
-  visionMaxImages: number,
-  dataUrls?: (string | undefined)[]
-): string | any[] {
-  if (!vision) return text
-
-  const max = visionMaxImages > 0 ? visionMaxImages : candidates.length
-  const parts: any[] = []
-  candidates.forEach((candidate, index) => {
-    parts.push({ type: 'text', text: `[${index + 1}] 所属组：${candidate.group} | 描述：${candidate.description || '（无描述）'}` })
-    if (index < max) {
-      const url = dataUrls ? dataUrls[index] : candidate.url
-      if (url) parts.push({ type: 'image_url', image_url: { url } })
-    }
-  })
-  const hintRule = visionMaxImages && candidates.length > 1
-    ? `并在 hint 字段中写一段「画面编排」：按选中顺序说明每个角色/元素在画面中的位置和姿态、`
-      + `彼此的动作互动与视线关系、共同所处的场景与氛围，以及需要还原的各自外形特征（发型发色、服装、配色、画风）。`
-      + `内容要像一段可以直接交给画师的分镜说明，而不是逐张罗列。`
-    : `并在 hint 字段中用一句话概括你选中图片的关键视觉特征（如发型、发色、服装、配色、姿态、画风），供后续绘图时还原该参考图。`
-
-  parts.push({
-    type: 'text',
-    text: `${text}\n\n（上方已按顺序附上候选图片，请结合图片实际内容挑选。${hintRule}仍然只输出 JSON。）`
-  })
-  return parts
-}
 
 /** HTML 转义，避免渲染时把文字当标签吃掉 */
 export function escapeHtml(text: string): string {
@@ -1065,11 +929,8 @@ interface CommandConfig {
       waitTimeout: number
       defaultImageUrls: string[]
       referenceGroups?: string[]
-      aiSelect?: boolean
-      aiMaxSelect?: number
-      aiAskUser?: boolean
-      /** 该指令是否在开画前请用户确认：'follow' 跟随全局 / 'on' 总是确认 / 'off' 从不确认 */
-      confirmBeforeDraw?: 'follow' | 'on' | 'off' | boolean
+      /** 该指令是否走 agent（默认跟随全局 agent.enabled） */
+      agent?: 'follow' | 'on' | 'off' | boolean
     }[]
   }
   defaultWaitTimeout: number
@@ -1081,6 +942,7 @@ interface CommandConfig {
   loggerinfo: boolean
   referenceGroups?: ReferenceGroup[]
   aiSelector?: AISelectorConfig
+  agent?: AgentConfig
   showPrompt?: boolean
   promptMaxLength?: number
   appendUserInput?: boolean
@@ -1089,14 +951,8 @@ interface CommandConfig {
   resultGallery?: ResultGalleryConfig
   backgroundDrawing?: BackgroundDrawingConfig
   textRender?: TextRenderConfig
-  /** 把处理过程中的多条提示合并成一条消息发出（省被动消息额度） */
-  mergeNotifications?: boolean
   /** 指令一触发就立刻回一条「收到」，避免用户以为卡住 */
   ackOnStart?: boolean
-  /** AI 选好参考图后先请用户确认再开画 */
-  confirmBeforeDraw?: boolean
-  /** 等待用户确认的时间（秒） */
-  confirmTimeout?: number
   /** 结果图用 markdown 的 ![](url) 单独发一条（支持的平台） */
   markdownImage?: boolean
   /** 结果图先经 assets 服务上传再发（外链在手机端 QQ 可能拉不到） */
@@ -1179,35 +1035,18 @@ interface ReferenceGroup {
   items: ReferenceImageItem[]
 }
 
-/** AI 选图配置 */
+/** AI 对话模型接口配置（agent 循环、提示词优化、生成描述都用它） */
 interface AISelectorConfig {
-  enabled: boolean
   baseUrl: string
   apiKey?: string
   model: string
-  prompt: string
-  maxSelect: number
   temperature: number
   timeout: number
   maxRetries: number
   retryInterval: number
   retryMaxWait: number
-  askUser: boolean
-  askTimeout: number
   includeAllGroups: boolean
   includeCommandDefaults: boolean
-  fallbackOnError: boolean
-  notify: boolean
-  vision: boolean
-  visionMaxImages: number
-  /** 识图时单张候选图的体积上限（MB），超过就只发文字描述 */
-  visionMaxImageBytes?: number
-  visionFallback: boolean
-  appendHint: boolean
-  twoStage: boolean
-  twoStageThreshold: number
-  retrievalTopK: number
-  keywordPrompt: string
   captionModel: string
   captionPrompt: string
   captionBatch: number
@@ -1216,28 +1055,52 @@ interface AISelectorConfig {
   optimizeTemperature?: number
   /** 输出长度参数名：auto / max_tokens / max_completion_tokens */
   maxTokensParam?: 'auto' | 'max_tokens' | 'max_completion_tokens'
-  /** 选图（精排）的输出长度上限。推理模型会把额度耗在思考上，太小会导致正文一个字都生成不出来 */
-  selectMaxTokens?: number
-  /** 两级检索「关键词」阶段的输出长度上限 */
-  keywordMaxTokens?: number
   /** 提示词优化（融合/扩写）的输出长度上限 */
   optimizeMaxTokens?: number
   /** 输出被截断时自动加大，最多加到这个值 */
   maxTokensCeiling?: number
-  /** 诊断指令名：发一次选图请求并回显模型原始返回 */
+  /** 诊断指令名：发一次模型请求并回显原始返回 */
   debugCommand?: string
-  /** 选图模式：score = 抽需求+逐图打分（默认）；legacy = 旧的候选全量丢给模型挑 */
-  selectionMode?: 'score' | 'legacy'
-  /** 打分制的最低分数线（0-100），低于它的图一律不选 */
-  minScore?: number
-  /** 打分制第一步「需求分析」的提示词模板 */
-  analyzePrompt?: string
-  /** 打分制第二步「逐图打分」的提示词模板 */
-  scorePrompt?: string
-  /** 是否合并描述完全相同的重复参考图（默认开） */
-  dedupe?: boolean
-  /** 用户说「不用参考/随意画」时是否跳过选图（默认开） */
-  respectSkipReference?: boolean
+}
+
+/** Agent 配置：把「要不要查图库 / 要不要追问 / 什么时候开画」全部交给模型自己决定 */
+interface AgentConfig {
+  /** 是否启用 agent 模式；关掉就退化成「指令提示词 + 用户附加需求直接画」 */
+  enabled: boolean
+  /** agent 用的模型，留空则用 aiSelector.model */
+  model: string
+  baseUrl?: string
+  apiKey?: string
+  /** 驱动 agent 行为的系统提示词（可参考 NeoBot 的 skill instructions 写法） */
+  instructions?: string
+  /** 最多来回几轮（每轮 = 一次模型请求 + 它要调的工具） */
+  maxIterations: number
+  /** 一次绘图最多用几张参考图 */
+  maxSelect: number
+  /** gallery_search 单次最多返回多少条 */
+  searchLimit: number
+  /** ask_user 等待用户回复的秒数 */
+  askTimeout: number
+  /** 开画前是否要求模型先问一句（写进提示词，由模型执行） */
+  confirmBeforeDraw: boolean
+  /** 单次模型请求的超时（秒） */
+  timeout: number
+  temperature: number
+  /** 单次回复的输出长度上限。推理模型会把额度耗在思考上，太小会一个字都生成不出来 */
+  maxTokens: number
+  /** 记住当前频道最近几轮对话（0 = 不记忆） */
+  historyTurns: number
+  /** 把每一轮的工具调用打到日志里，方便排查 */
+  debugLog: boolean
+}
+
+/** agent 参考图登记表里的一条 */
+export interface RefEntry {
+  id: string
+  url: string
+  description: string
+  group: string
+  source: 'gallery' | 'user' | 'cmd'
 }
 
 /** 交给 AI 挑选的候选图片 */
@@ -1246,47 +1109,6 @@ interface CandidateImage {
   url: string
   description: string
 }
-
-/** AI 选择结果 */
-interface SelectionResult {
-  picked: CandidateImage[]
-  needUserImage: boolean
-  askMessage: string
-  reason: string
-  ok: boolean
-  /** 失败原因（如 429 限流），供回显给用户 */
-  error?: string
-  /** 模型看到图片后给出的关键视觉特征描述（开启识别图片时才有），可并入绘图提示词 */
-  hint?: string
-  /** 第一阶段产出的检索关键词 */
-  keywords?: string[]
-  /** 两级检索时从多少张里召回了多少张，用于回显 */
-  recalled?: number
-  total?: number
-  /** 模型认为「画面上需要出现的文字」（台词/标题/字幕），交给浏览器渲染成参考图 */
-  renderText?: string
-}
-
-const DEFAULT_SELECTOR_PROMPT = `你是一个「参考图片选择助手」。用户正在使用 AI 绘图功能，需要从下方的候选参考图片池中挑选最符合其需求的图片作为绘图参考。
-
-可用参考图片列表（编号 | 所属组 | 描述）：
-{candidates}
-
-当前使用的绘图指令：{command}
-该指令的用途提示词：{prompt}
-用户的附加需求：{userInput}
-
-规则：
-1. 仔细阅读每张图片的描述（如果同时附上了图片本身，以图片实际内容为准），挑选最贴合用户需求与指令用途的参考图片，最多选择 {max} 张。
-2. 如果候选池里没有任何图片能满足用户需求（缺失关键参考图），将 needUserImage 设为 true，并在 askMessage 中用一句话告诉用户需要补充发送什么样的图片（中文，40 字以内，语气自然，直接对用户说）。
-3. 判断这次的画面上**是否需要出现文字**（台词、对白、标题、招牌、字幕等）。需要的话，把要显示的所有文字写进 text 字段：
-   - 每行一句，多句用 \\n 换行；只写真正要出现在画面上的字，不要写解释、不要加引号以外的装饰。
-   - 一句也不要超过 30 个字，长句请拆成多行。
-   - 不需要出现文字就留空字符串。
-4. 只输出一个 JSON 对象，不要输出任何解释、Markdown 代码块或多余文字。
-
-输出格式：
-{"selected": [编号1,编号2], "reason": "一句话说明选择理由", "needUserImage": false, "askMessage": "", "text": ""}`
 
 /** 把用户附加需求融合进原始提示词（而不是贴在最末尾） */
 const DEFAULT_OPTIMIZE_PROMPT = `你是绘图提示词优化助手。下面是「绘图指令的原始提示词」和「用户本次的需求」。
@@ -1313,78 +1135,52 @@ const DEFAULT_CAPTION_PROMPT = `请用一句中文描述这张图片的关键视
 
 只输出这一句描述，不要解释、不要换行、不要 Markdown、不要加引号。`
 
-/** 两级检索第一阶段：让模型产出检索关键词（参考 NeoBot 的 gallery_search 思路） */
-const DEFAULT_KEYWORD_PROMPT = `你是一个参考图片检索助手。用户要用 AI 绘图，需要从下面的图片索引里找出可能相关的参考图。
+/**
+ * 驱动 agent 行为的系统提示词（参考 NeoBot 的 skill.instructions 写法）。
+ *
+ * 关键区别：**这里不写「怎么选图」的规则链，只写「有哪些工具 + 什么时候该用」**。
+ * 选谁、问不问、什么时候开画，全交给模型自己判断。
+ */
+const DEFAULT_AGENT_INSTRUCTIONS = `你是 QQ 群里的绘图助手。用户发一条绘图指令，你要在**尽量少的来回**里把图交出去。
 
-图片索引（编号 | 所属组 | 描述）：
-{index}
+可用工具：
+- gallery_search：按关键词搜索参考图库。**涉及具体角色/立绘时必须先搜一次**。
+  多个关键词用空格分隔（如「白发 立绘」），全部命中的排在最前；搜不到就换个词再搜。
+- ask_user：把问题发给用户**并等他回复**（他发的图也会一起带回来）。
+- draw：真正开始画。把 prompt 和挑中的参考图编号交进去，画好会自动发到群里。
 
-绘图指令：{command}
-指令用途提示词：{prompt}
-用户需求：{userInput}
+工作规则：
+1. 【角色立绘参考规则（强制）】涉及任何角色（群友 OC、动画角色、甚至你自己）的绘图请求：
+   - 先用 gallery_search 搜该角色名/特征，看图库里有没有立绘；
+   - 有合适的 → 把它的 id 写进 draw 的 references；
+   - 没有 → 如实告诉用户「图库里没有这个角色的立绘，将按描述创作」，然后正常画；
+   - 用户明确表示「不用参考 / 随意画 / 自由发挥」时，跳过搜索，一次都别搜。
+2. 信息不够才开口问，而且**一次只问一个最关键的问题**（缺谁？缺什么场景？缺什么画风？）。
+   不要把几个不相关的问题塞进一句话，不要顺带聊别的，不要复述用户已经说过的话。
+3. 开画确认：{confirmRule}
+4. 画面上要出现文字（台词、标题、招牌、字幕）时，把文字原样写进 prompt，并说明「这些字必须原样出现，不能变形或自创字形」。
+5. draw 返回 ok=false 时，看 error 决定：能改的（提示词问题）就换个写法重试，改不了的（限流/配额）就如实告诉用户。
+6. 流程结束后用中文回一句简短的结果说明（不要复述 prompt，不要写小作文，不要再问「还要我做什么」）。
+7. 图片编号：gallery_search 结果里的 id、用户发的图（user1、user2…）、指令默认图（cmd1…）都可以直接写进 draw 的 references。
+   只填你确认存在的编号，**绝对不要编造 id**。
 
-请输出：
-1. keywords：3-6 个检索关键词（中文，提炼用户需求里的核心视觉要素，如人物特征、发型发色、服装、动作、画风、场景），
-   用于在完整图库里做文本匹配检索。关键词要写得像图片描述里会出现的词。
-2. candidates：你从上面索引里直接看中的编号（最多 {topK} 个，可以为空数组）。
+如果你所在的接口不支持函数调用，就**只输出一行 JSON** 来调用工具，例如：
+{"tool":"gallery_search","args":{"keyword":"白发 立绘"}}
+{"tool":"ask_user","args":{"question":"想要什么画风？"}}
+{"tool":"draw","args":{"prompt":"...","references":["ref1","user1"]}}
+不想调用工具时，正常输出给用户看的中文即可。`
 
-只输出一个 JSON 对象，不要输出解释或代码块：
-{"keywords":["关键词1","关键词2"],"candidates":[1,3]}`
+/** 「开画前先问一句」的两种提示词分支 */
+const AGENT_CONFIRM_RULE_ON = `**必须先 ask_user**：用一句话告诉用户「这次会参考哪几张图 + 大致画成什么样」，用户点头后才能调用 draw。
+用户回复了否定或提出修改意见，就按他说的改，再确认一次或直接画（他说「直接画」就不用再问）。`
+const AGENT_CONFIRM_RULE_OFF = `用户需求已经明确的，直接调用 draw，不用多问一句。只有真的缺关键信息才 ask_user。`
 
-/** 第一步：只做需求分析，不给候选图 —— 模型没有「挑」的机会，从根上避免乱选 */
-const DEFAULT_ANALYZE_PROMPT = `你是绘图参考图的「需求分析助手」。**这一步只做分析，不要挑选任何图片。**
-
-绘图指令：{command}
-该指令的用途提示词：{prompt}
-用户本次的需求：{userInput}
-
-请先把「这次画面上必须有 / 最好有的视觉要素」想清楚，再输出 JSON。
-
-规则：
-1. must（硬性要素）：缺一个就不该选这张参考图。只写**能从图片上看出来的**视觉特征，
-   例如角色名、发色发型、瞳色、服装款式、配饰、物种、画风。不要写抽象词（如「好看」「高级」）。
-   指令用途提示词里本来就固定的风格（比如「1/7 手办」「透明亚克力底座」）不要写进 must。
-2. nice（加分要素）：有更好、没有也能用，例如动作、表情、构图、场景、氛围。
-3. avoid：明确不要出现的东西（用户说「不要 XX」「换成 YY」时，把被否掉的那个写这里）。
-4. subject：这次画面的主体，一句话（如「白发的少女」）。
-5. text：画面上需要出现的文字（台词/标题/招牌/字幕），多行用 \\n 换行；不需要就空字符串。
-6. skipReference：用户明确表示「不用参考 / 随意画 / 自由发挥 / 你看着办」时为 true。
-7. needTypes：图库里**没有**合适参考图时，插件要请用户补发一张。这里写一句**直接对用户说**的话
-   （中文，40 字以内，语气自然，不要用「请提供图片」这种套话），例如「能发一张白发水手服的立绘吗？」。
-   **只写这一句**：不要追问第二件事、不要闲聊、不要提到模型名字（如 DeepSeek）、不要写「顺便说说」之类的话。
-   图库里不缺图就留空字符串。
-
-只输出一个 JSON 对象，不要解释、不要 Markdown 代码块：
-{"subject":"","must":[],"nice":[],"avoid":[],"text":"","skipReference":false,"needTypes":""}`
-
-/** 第二步：逐图显式打分 —— 强制给每张打分 + 硬性要素缺失即判低分，杜绝"硬凑数" */
-const DEFAULT_SCORE_PROMPT = `你是绘图参考图的「打分助手」。下面是已经分析好的需求，以及若干候选参考图。
-**你的任务是给每一张候选图打分，而不是挑出「最像的」来凑数。**
-
-本次需求：
-主体：{subject}
-硬性要素（缺一个就不合格）：{must}
-加分要素：{nice}
-不要出现：{avoid}
-
-候选参考图（编号 | 所属组 | 描述）：
-{candidates}
-
-打分规则：
-1. **必须给每一张候选图都打一个 0-100 的分数**，一张都不能漏。
-2. 打分只看「这张图能不能当本次绘图的参考」：
-   - 硬性要素命中得越多分越高；**硬性要素缺失或与需求矛盾 → 只能给 0-30 分**。
-   - 描述为空、看不懂内容、无法判断的图 → **一律给 0 分**，不要靠猜。
-   - 与 avoid 冲突的 → 0 分。
-   - 命中加分要素、或组名/描述与需求高度吻合 → 可以给 80-100。
-3. **宁可漏选，不可乱选。** 拿不准就打低分。给不相关的图打高分是最严重的错误。
-4. 如果所有候选都不合适，就照实全部打低分，**不要为了凑数抬高分数**。
-5. why 用不超过 15 个字说明理由，例如「命中白发+水手服」「描述为空无法判断」。
-6. hint（可选）：**只有在你实际看到了图片时**才填 —— 用一句话概括选中图片里决定外观的关键视觉特征
-   （发色发型/瞳色/服装/配饰/画风），便于并入绘图提示词；只给了文字描述就留空字符串。
-
-只输出一个 JSON 对象，不要解释、不要 Markdown 代码块：
-{"scores":[{"index":1,"score":85,"why":"命中白发双马尾"},{"index":2,"score":0,"why":"描述为空"}],"hint":""}`
+/** 模型所在接口不支持 function calling 时，追加这条规则，改用「一行 JSON」调工具 */
+const AGENT_JSON_FALLBACK_RULE = `（注意：当前接口不支持函数调用）请你**只用一行 JSON** 来调用工具，不要输出别的内容：
+{"tool":"gallery_search","args":{"keyword":"白发 立绘"}}
+{"tool":"ask_user","args":{"question":"想要什么画风？"}}
+{"tool":"draw","args":{"prompt":"...","references":["ref1","ref2"]}}
+不需要调用工具时，正常输出给用户看的中文即可。`
 
 const defaultCommands: any[] = [
   {
@@ -1834,15 +1630,12 @@ export const Config: Schema = Schema.intersect([
           maxImages: Schema.number().default(1).min(0).max(5).description('需要用户提供的最大图片数量（不包括默认图片）'),
           waitTimeout: Schema.number().default(30).max(120).min(10).step(1).description("等待输入图片的最大时间（秒）"),
           defaultImageUrls: Schema.array(Schema.string().role('link')).description('默认图片URL列表（不计入用户图片数量）').default([]),
-          referenceGroups: Schema.array(Schema.string()).description('引用的参考图片组名称（AI 将从这些组中挑选图片，留空则由「AI 选图设置」决定是否使用全部组）').default([]),
-          aiSelect: Schema.boolean().default(true).description('启用 AI 智能选择参考图片'),
-          aiMaxSelect: Schema.number().default(0).min(0).max(10).step(1).description('AI 最多为该指令选择的参考图片数量（0 = 跟随「AI 选图设置」里的全局数量）'),
-          aiAskUser: Schema.boolean().default(true).description('缺少合适参考图时询问用户补充发送'),
-          confirmBeforeDraw: Schema.union([
+          referenceGroups: Schema.array(Schema.string()).description('引用的参考图片组名称（agent 只能在这些组里搜图，留空则由「AI 模型接口」的「允许搜索全部组」决定）').default([]),
+          agent: Schema.union([
             Schema.const('follow').description('跟随全局设置'),
-            Schema.const('on').description('开画前请用户确认'),
-            Schema.const('off').description('选好图直接开画'),
-          ]).default('follow').description('该指令是否在开画前请用户确认'),
+            Schema.const('on').description('走 agent 模式（交给 AI 自己查图/追问/开画）'),
+            Schema.const('off').description('不走 agent（指令提示词 + 用户附加需求直接画）'),
+          ]).default('follow').description('该指令是否走 agent 模式'),
         })).description('指令配置').default(defaultCommands),
     }).collapse().description('指令配置项太长啦，这样折叠起来更方便哦~'),
 
@@ -1898,43 +1691,18 @@ export const Config: Schema = Schema.intersect([
 
   Schema.object({
     aiSelector: Schema.object({
-      enabled: Schema.boolean().default(false).description('启用 AI 智能选择参考图片（默认关闭，需要时手动开启）'),
-      selectionMode: Schema.union([
-        Schema.const('score').description('打分制（推荐）：先分析需求 → 关键词召回 → 逐图打分 → 分数不够就如实说「没有合适的图」'),
-        Schema.const('legacy').description('旧版：把候选图全部丢给模型一次挑完（容易硬凑数，仅在需要兼容时使用）'),
-      ]).default('score').description('选图模式。打分制会给模型留退路，不会在没有合适图时硬挑一张'),
-      minScore: Schema.number().default(60).min(0).max(100).step(5).description('打分制的最低分数线（0-100）。低于该分数的参考图一律不选；全部不达标就判定「图库没有合适的图」并询问用户补图'),
-      dedupe: Schema.boolean().default(true).description('合并重复参考图（链接相同，或描述完全相同的近似图只保留一张）'),
-      respectSkipReference: Schema.boolean().default(true).description('用户说「不用参考 / 随意画 / 自由发挥」时跳过选图，一次选图请求都不发（需求分析也省掉）'),
-      baseUrl: Schema.string().role('link').description('AI 选图接口地址（OpenAI 兼容 Chat Completions，留空则复用绘图接口地址）'),
-      apiKey: Schema.string().role('secret').description('AI 选图接口密钥（留空则复用绘图 API 密钥）'),
-      model: Schema.string().default('Qwen/Qwen2.5-7B-Instruct').description('用于选择参考图片的对话模型'),
-      prompt: Schema.string().role('textarea', { rows: [12, 6] }).default(DEFAULT_SELECTOR_PROMPT).description('选择提示词模板，可用占位符：{candidates} 候选图片列表、{userInput} 用户附加需求、{max} 最多选择数量、{command} 指令名、{prompt} 指令提示词'),
-      maxSelect: Schema.number().default(1).min(1).max(10).step(1).description('默认最多选择的参考图片数量（指令内可单独覆盖）'),
-      temperature: Schema.number().default(0.2).min(0).max(2).step(0.1).description('采样温度（越低越稳定）'),
+      baseUrl: Schema.string().role('link').description('AI 对话接口地址（OpenAI 兼容 Chat Completions，留空则复用绘图接口地址）'),
+      apiKey: Schema.string().role('secret').description('AI 对话接口密钥（留空则复用绘图 API 密钥）'),
+      model: Schema.string().default('Qwen/Qwen2.5-7B-Instruct').description('对话模型（agent 循环、提示词优化、生成描述都用它）'),
+      temperature: Schema.number().default(0.3).min(0).max(2).step(0.1).description('采样温度（越低越稳定）'),
       timeout: Schema.number().default(60).min(10).max(300).step(5).description('请求超时时间（秒）'),
       maxRetries: Schema.number().default(2).min(0).max(5).step(1).description('请求失败重试次数（0 表示不重试）'),
       retryInterval: Schema.number().default(3000).min(500).max(30000).step(500).description('重试基础间隔（毫秒）；遇到 429/限流会在此基础上指数退避，并优先遵循响应头的 Retry-After'),
       retryMaxWait: Schema.number().default(20).min(0).max(120).step(5).description('单次重试最长等待时间（秒），超过则不再重试（0 表示不限）'),
-      askUser: Schema.boolean().default(true).description('缺少合适参考图时询问用户补充发送'),
-      askTimeout: Schema.number().default(60).min(10).max(120).step(5).description('等待用户补充发送图片的时间（秒）'),
-      includeAllGroups: Schema.boolean().default(true).description('指令未指定组时，允许 AI 从全部参考图片组中挑选'),
-      includeCommandDefaults: Schema.boolean().default(false).description('把指令的「默认图片URL列表」也纳入 AI 候选池'),
-      fallbackOnError: Schema.boolean().default(false).description('AI 选图失败时回退为使用候选池内全部图片（默认关闭，失败则不使用参考图）'),
-      notify: Schema.boolean().default(true).description('在处理提示中附带 AI 选图结果'),
-      vision: Schema.boolean().default(false).description('选图模型支持识别图片（多模态/VL）。开启后会把候选图片本身一起发给模型，而不只是发文字描述，选得更准（需要图片链接能被模型访问）'),
-      visionMaxImages: Schema.number().default(6).min(1).max(20).step(1).description('开启识别图片时，最多附带多少张候选图片（超出部分只发文字描述，避免请求过大）'),
-      visionMaxImageBytes: Schema.number().default(4).min(0).max(32).step(1).description('识图时单张候选图的体积上限（MB）。插件会先把图片自己下载下来转成 base64 再发给选图模型（上游拉不到你的图片链接时会整条请求 400），超过上限的只发文字描述'),
-      visionFallback: Schema.boolean().default(true).description('带图片请求失败时，自动退回纯文字再试一次'),
-      appendHint: Schema.boolean().default(true).description('把模型看图后给出的关键视觉特征并入绘图提示词（仅在开启识别图片时生效，让出图更还原参考图）'),
-      twoStage: Schema.boolean().default(true).description('【仅旧版模式生效】两级检索选图：先让模型产出检索关键词并在本地召回，再对召回结果精排。打分制已内置召回，无需此项'),
-      twoStageThreshold: Schema.number().default(12).min(2).max(200).step(1).description('候选图片超过多少张才启用两级检索（少于此值直接一次问完，更省事）'),
-      retrievalTopK: Schema.number().default(12).min(1).max(50).step(1).description('第一级召回的候选数量上限（精排只看这么多张）'),
-      keywordPrompt: Schema.string().role('textarea', { rows: [10, 6] }).default(DEFAULT_KEYWORD_PROMPT).description('检索提示词模板，可用占位符：{index} 图片索引、{userInput} 用户附加需求、{command} 指令名、{prompt} 指令提示词、{topK} 召回上限'),
-      analyzePrompt: Schema.string().role('textarea', { rows: [12, 6] }).default(DEFAULT_ANALYZE_PROMPT).description('（打分制第一步）需求分析提示词，可用占位符：{command} 指令名、{prompt} 指令提示词、{userInput} 用户附加需求。这一步**不把候选图给模型**，所以模型没有乱选的机会'),
-      scorePrompt: Schema.string().role('textarea', { rows: [12, 6] }).default(DEFAULT_SCORE_PROMPT).description('（打分制第二步）逐图打分提示词，可用占位符：{subject} 主体、{must} 硬性要素、{nice} 加分要素、{avoid} 不要出现、{candidates} 候选图片列表、{max} 最多选择数量'),
+      includeAllGroups: Schema.boolean().default(true).description('指令未指定组时，允许 agent 搜索全部参考图片组'),
+      includeCommandDefaults: Schema.boolean().default(false).description('把指令的「默认图片URL列表」也纳入可搜索的参考图'),
       captionCommand: Schema.string().default('生成描述').description('自动生成描述的指令名（挂在指令根下；直接发图则只识别并返回描述）'),
-      captionModel: Schema.string().description('生成描述用的模型（留空则用上面的选图模型；必须是支持图片输入的模型）'),
+      captionModel: Schema.string().description('生成描述用的模型（留空则用上面的对话模型；必须是支持图片输入的模型）'),
       captionPrompt: Schema.string().role('textarea', { rows: [8, 4] }).default(DEFAULT_CAPTION_PROMPT).description('生成描述的提示词（要求模型写出便于检索的关键词）'),
       captionBatch: Schema.number().default(8).min(1).max(50).step(1).description('一次指令最多为多少张参考图生成描述（避免请求过多被限流）'),
       optimizeTemperature: Schema.number().default(0.7).min(0).max(2).step(0.1).description('提示词优化（融合/扩写）用的采样温度，比选图高一些更有创造性'),
@@ -1943,13 +1711,31 @@ export const Config: Schema = Schema.intersect([
         Schema.const('max_tokens').description('始终用 max_tokens'),
         Schema.const('max_completion_tokens').description('始终用 max_completion_tokens（新模型不支持 max_tokens 时会返回空内容）'),
       ]).default('auto').description('输出长度参数名。模型不支持 max_tokens 时会返回空内容，导致「响应中没有文本内容」'),
-      debugCommand: Schema.string().default('测试选图').description('诊断指令名（挂在指令根下）：发一次选图请求并回显模型原始返回，用于排查「没有文本内容」'),
-      selectMaxTokens: Schema.number().default(8000).min(0).max(64000).step(500).description('选图（精排）的输出长度上限。**推理模型（DeepSeek-V4.1-Flash 等）会把额度耗在思考上**，太小会导致正文一个字都生成不出来，报「响应中没有文本内容」。0 = 不限制'),
-      keywordMaxTokens: Schema.number().default(3000).min(0).max(64000).step(500).description('两级检索「关键词」阶段的输出长度上限（0 = 不限制）'),
+      debugCommand: Schema.string().default('测试选图').description('诊断指令名（挂在指令根下）：发一次模型请求并回显原始返回，用于排查「没有文本内容」'),
       optimizeMaxTokens: Schema.number().default(8000).min(0).max(64000).step(500).description('提示词优化（融合/扩写）的输出长度上限（0 = 不限制）'),
       maxTokensCeiling: Schema.number().default(32000).min(1000).max(128000).step(1000).description('输出被截断时自动加大上限，最多加到这个值'),
-    }).collapse().description('AI 选图配置项（提示词较长，已折叠）'),
-  }).description('AI 选图设置'),
+    }).collapse().description('AI 对话模型接口（提示词较长，已折叠）'),
+  }).description('AI 模型接口'),
+
+  Schema.object({
+    agent: Schema.object({
+      enabled: Schema.boolean().default(true).description('启用 Agent 模式：把「查不查图库 / 要不要追问 / 什么时候开画」全部交给对话模型自己决定（关掉就退化成「指令提示词 + 用户附加需求直接画」）'),
+      confirmBeforeDraw: Schema.boolean().default(true).description('开画前先让 AI 问一句：把「这次参考哪几张图 + 大致画成什么样」发给用户，用户点头才画（这条是写进提示词的，由模型执行）'),
+      maxIterations: Schema.number().default(8).min(1).max(30).step(1).description('最多来回几轮（每轮 = 一次模型请求 + 它要调的工具）。防死循环的天花板'),
+      maxSelect: Schema.number().default(3).min(1).max(10).step(1).description('一次绘图最多使用几张参考图（模型给多了会被截断到这个数）'),
+      searchLimit: Schema.number().default(12).min(1).max(50).step(1).description('gallery_search 单次最多返回多少条结果'),
+      askTimeout: Schema.number().default(120).min(10).max(600).step(10).description('ask_user 等待用户回复的时间（秒），超时会告诉模型「用户没回」'),
+      timeout: Schema.number().default(120).min(10).max(600).step(10).description('单次模型请求超时（秒）'),
+      temperature: Schema.number().default(0.3).min(0).max(2).step(0.1).description('agent 循环用的采样温度'),
+      maxTokens: Schema.number().default(8000).min(0).max(64000).step(500).description('agent 单次回复的输出长度上限。**推理模型会把额度耗在思考上**，太小会一个字都生成不出来。0 = 不限制'),
+      historyTurns: Schema.number().default(6).min(0).max(30).step(1).description('记住当前频道最近几轮对话（让「再画一张」「换个风格」能接上），0 = 不记忆'),
+      debugLog: Schema.boolean().default(false).description('把 agent 每一轮的模型输出与工具调用写进日志，排查用'),
+      model: Schema.string().description('agent 专用的模型（留空则用「AI 模型接口」里的模型）。**需要支持 function calling**；不支持时插件会自动改用「一行 JSON」协议'),
+      baseUrl: Schema.string().role('link').description('agent 专用接口地址（留空则复用「AI 模型接口」的地址）'),
+      apiKey: Schema.string().role('secret').description('agent 专用密钥（留空则复用「AI 模型接口」的密钥）'),
+      instructions: Schema.string().role('textarea', { rows: [16, 8] }).default(DEFAULT_AGENT_INSTRUCTIONS).description('驱动 agent 行为的系统提示词（只写「有哪些工具 + 什么时候用」，别写死流程）。可用占位符：{confirmRule} 开画确认规则、{command} 指令名、{prompt} 指令提示词、{userInput} 用户附加需求、{imageCount} 用户随消息发的图数量、{refCount} 可检索的参考图数量。指令名/提示词等上下文会自动附在提示词末尾，不用自己引用'),
+    }).collapse().description('Agent 配置（指令较长，已折叠）'),
+  }).description('Agent 模式'),
 
   Schema.object({
     appendUserInput: Schema.boolean().default(true).description('把用户随指令发的附加需求并入绘图提示词（例如「手办化 xxx 在偷吃白饭被发现的表情」）'),
@@ -1992,10 +1778,7 @@ export const Config: Schema = Schema.intersect([
   }).description('文字渲染参考图（防崩字）'),
 
   Schema.object({
-    mergeNotifications: Schema.boolean().default(true).description('把「选图结果 / 正在处理 / 优化后提示词」合并成**一条**消息发出（QQ 被动回复有次数上限，消息越少越稳）'),
-    ackOnStart: Schema.boolean().default(true).description('指令一触发就立刻回一条「收到，正在准备...」。后面的「优化提示词 + AI 选图」是两轮模型请求、可能要几十秒，不发这条用户会以为机器人卡住了'),
-    confirmBeforeDraw: Schema.boolean().default(true).description('AI 选好参考图后**先请用户确认再开始画**（把「本次参考这几张图」列出来，回复「确认」才画）。可防止选错参考图白画一张'),
-    confirmTimeout: Schema.number().default(60).min(5).max(300).step(5).description('等待用户确认的时间（秒），超时按取消处理；0 = 不限时'),
+    ackOnStart: Schema.boolean().default(true).description('指令一触发就立刻回一条「收到，正在准备...」。后面的「优化提示词 + agent 思考」是两轮模型请求、可能要几十秒，不发这条用户会以为机器人卡住了'),
     markdownImage: Schema.boolean().default(true).description('生成结果用 markdown 的 ![](图片链接) 单独发一条；不支持 markdown 的平台自动退回普通图片消息'),
     imageViaAssets: Schema.boolean().default(true).description('结果图先经 assets 服务上传再发。外链在手机端 QQ 常常拉不到，装上 koishi-plugin-assets-qqbot-part-file 之类的 assets 插件后由它转成平台可访问的地址；上传失败会自动用原链接'),
     autoImageSize: Schema.boolean().default(true).description('自动按**图片真实比例**生成 markdown 尺寸（填死宽高会把非方形图拉伸变形）'),
@@ -2192,6 +1975,15 @@ export function apply(ctx: Context, config: CommandConfig) {
     await bot.sendMessage(channelId, body, guildId)
   }
 
+  // 每个频道最近几轮的对话（agent 记忆，只存纯文本，重启即失效）
+  const agentHistories = new Map<string, any[]>()
+  /** 「agent 接口地址没单独配」这条警告只打一次，别刷屏 */
+  let agentUrlWarned = false
+
+  function agentHistoryKey(session: Session): string {
+    return `${session.platform}:${session.channelId || session.userId || ''}`
+  }
+
   ctx.on('ready', () => {
 
     ctx.i18n.define("zh-CN", {
@@ -2204,25 +1996,12 @@ export function apply(ctx: Context, config: CommandConfig) {
           invalidimage: '未检测到有效的图片，请重新发送带图片的消息',
           processing: '正在处理图片，请稍候...',
           ack: '收到，正在准备...',
-          confirmask: '准备开始绘图，本次会参考：\n{0}\n\n回复「确认」开始画（{1} 秒内未确认则取消）',
-          confirmcancel: '未收到确认，已取消本次绘图',
-          confirmok: '已确认，开始绘图...',
           failed: '图片生成失败，请稍后重试',
           error: '处理过程中发生错误，请稍后重试',
           needprompt: '请提供自定义提示词',
           needimages: '请提供至少一张图片',
-          selecting: '正在智能挑选参考图片...',
-          selectfailed: 'AI 选图失败（{0}），已改用全部候选参考图片',
-          selectfailedNoFallback: 'AI 选图失败（{0}），本次不使用参考图片',
-          nomatch: '图库里没有合适的参考图：{0}',
-          selected: '已为你挑选参考图片：\n{0}',
-          askimage: '{0}\n请在{1}秒内发送图片...',
-          askimageDefault: '候选参考图片里没有合适的图片，需要你补充一张参考图',
-          noask: '未收到补充图片，继续处理',
-          gotimage: '已收到补充图片，继续处理...',
-          recalled: '（参考图检索：{0} 张中命中 {1} 张候选）',
-          hintsingle: '参考图关键特征（务必还原）：{0}',
-          hintscene: '画面编排（务必还原）：{0}',
+          agentfailed: '绘图助手这次没跑起来（{0}）。可以先关掉「Agent 模式」照常画图，或换一个支持工具调用的模型。',
+          agentnoresult: '这次没能理出个结果来，麻烦再说一次你想画什么～',
           optimizefailed: '（提示词融合失败，已改为追加模式）',
           bgstart: '已开始后台绘图（{0} 张图），画好后会在这里通知你...',
           bgqueue: '（当前有 {0} 个任务在排队）',
@@ -2255,36 +2034,20 @@ export function apply(ctx: Context, config: CommandConfig) {
           }
           if (!session) return
 
-          const quote = h.quote(session.messageId)
-          const customCommand = cmdConfig.custom || false
-          const maxImages = cmdConfig.maxImages || 0 // 用户需要提供的图片数量
-          const waitTimeout = cmdConfig.waitTimeout || config.defaultWaitTimeout
-          const defaultImageUrls = cmdConfig.defaultImageUrls || [] // 多个默认图片URL
+          const cmdName = cmdConfig.name
+          const defaultImageUrls = cmdConfig.defaultImageUrls || []
 
-          let promptText = cmdConfig.prompt
-          let images: string[] = []
-          let userImages: string[] = []
-
-          // AI 选图相关开关
-          const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
-          const aiSelectOn = selector.enabled !== false && cmdConfig.aiSelect !== false
-          // 指令级为 0（默认）时跟随全局数量；否则以指令级为准
-          const aiMaxSelect = (cmdConfig.aiMaxSelect || 0) > 0 ? cmdConfig.aiMaxSelect : (selector.maxSelect || 1)
-          const aiAskOn = cmdConfig.aiAskUser !== false && selector.askUser !== false
-          const aiAskTimeout = selector.askTimeout || waitTimeout
-
-          // 用户随指令附带的文本（并入提示词，同时也作为 AI 选图的参考）
+          // 用户随指令附带的文本
           // 必须用指令参数 message：session.stripped.content 是整条消息，会把指令名一起带进来
           let userInputText = ''
           if (message) userInputText = String(message).trim()
           if (!userInputText) {
             userInputText = stripCommandName(extractTextFromMessage(session.stripped.content), cmdConfig.name)
           }
-          logInfo(`用户附加需求: ${userInputText || '（无）'}`)
+          logInfo(`[${cmdName}] 用户附加需求: ${userInputText || '（无）'}`)
 
           // ============ 立刻回一条「收到」 ============
-          // 后面「优化提示词 + AI 选图」是两轮模型请求，加起来可能要几十秒，
-          // 期间一句话都不发，用户会以为机器人在卡死（连指令有没有被识别都不知道）。
+          // 后面的 agent 思考 + 绘图都要几十秒，期间一句话不发用户会以为卡死。
           if (config.ackOnStart !== false) {
             try {
               await reply(session, [session.text('image-prompt.messages.ack')])
@@ -2293,387 +2056,518 @@ export function apply(ctx: Context, config: CommandConfig) {
             }
           }
 
-          // ============ 合并消息（省 QQ 被动消息额度） ============
-          // 「正在选图 / 处理中 / 优化后的提示词」先攒着，最后合成一条发出去。
-          // 只有需要用户立刻回应（等你发图）时才提前 flush。
-          const noticeLines: string[] = []
-          const notify = (text: any) => {
-            const value = String(text ?? '').trim()
-            if (value) noticeLines.push(value)
-          }
-          async function flushNotice(): Promise<void> {
-            if (!noticeLines.length) return
-            const lines = noticeLines.slice()
-            noticeLines.length = 0
-
-            const md = supportsMarkdown(session.platform)
-            const send = (text: string) => reply(session, [md ? h('markdown', text) : text])
-            const merged = lines.join('\n').trim()
-            if (!merged) return
-
-            // QQ markdown 单条有长度上限：整体放不下就把提示词块拆成第二条，
-            // 宁可多一条也不能整条发不出去
-            if (merged.length <= 4000) {
-              await send(merged)
-              return
-            }
-            const fenceAt = lines.findIndex(line => line.includes('```'))
-            if (fenceAt > 0) {
-              const head = lines.slice(0, fenceAt).join('\n').trim()
-              const tail = lines.slice(fenceAt).join('\n').trim()
-              if (head) await send(head)
-              await send(tail)
-              return
-            }
-            await send(merged)
-          }
-
-          // 添加所有默认图片（若交给 AI 挑选，则不在此时直接加入）
-          if (defaultImageUrls.length > 0 && !(aiSelectOn && selector.includeCommandDefaults)) {
-            images.push(...defaultImageUrls)
-            logInfo(`添加 ${defaultImageUrls.length} 张默认图片`)
-          }
-
-          // 自定义指令：本身没有提示词、用户也没给文本时，向用户索要
-          if (customCommand && !promptText && !userInputText) {
-            const [msgId] = await session.send(session.text("image-prompt.messages.customprompt", [waitTimeout]))
-            const userPrompt = await session.prompt(waitTimeout * 1000)
-
-            try {
-              await session.bot.deleteMessage(session.channelId, msgId)
-            } catch {
-              ctx.logger.warn(`在频道 ${session.channelId} 尝试撤回消息ID ${msgId} 失败。`)
-            }
-
-            if (userPrompt) {
-              userInputText = extractTextFromMessage(userPrompt) || String(userPrompt).trim()
-            } else {
-              await reply(session, [session.text("image-prompt.messages.needprompt")])
-              return
-            }
-          }
-
-          let optimizeFailed = false
-
-          // 用户随指令发的附加需求并入绘图提示词（自定义指令、普通指令都生效）
-          // 例如「手办化 xxx 在偷吃白饭被发现的表情」——否则只会被拿去选图，画图时丢掉
-          if (userInputText && config.appendUserInput !== false) {
-            promptText = mergePrompt(promptText, userInputText, true)
-            logInfo(`已并入用户附加需求: ${userInputText}`)
-
-            // 融合重写：把需求写进提示词对应位置，而不是贴在最后
-            if (config.promptOptimize === 'rewrite') {
-              const optimized = await optimizePromptText(cmdConfig.prompt, userInputText)
-              if (optimized) {
-                promptText = optimized
-                logInfo('提示词已融合重写')
-              } else {
-                ctx.logger.warn('提示词融合重写失败，保留追加后的提示词')
-                optimizeFailed = true
-              }
-            }
-          }
-
-          // ================== AI 智能选择参考图片 ==================
-          let selectionNote = ''
-          let aiProvidedImages = 0 // AI 选中的参考图数量（计入「还需用户提供」的抵扣）
-          let aiRenderText = '' // 选图模型认为画面上要出现的文字（台词/标题/字幕）
-          // 本次要参考的图片清单（给「开画前确认」用）
-          const refDescs: string[] = []
-          if (aiSelectOn) {
-            const candidates = collectCandidates(cmdConfig, defaultImageUrls)
-            const declaredGroups = (cmdConfig.referenceGroups || []).filter(Boolean)
-            logInfo(`AI 选图候选图片数量: ${candidates.length}`)
-
-            if (candidates.length > 0) {
-              // 合并模式下不再单独发「正在挑选」（那条本来也要撤回，白占一次被动消息额度）
-              if (config.mergeNotifications === false) {
-                const [selMsgId] = await reply(session, [session.text('image-prompt.messages.selecting')])
-                try {
-                  await session.bot.deleteMessage(session.channelId, selMsgId)
-                } catch {
-                  ctx.logger.warn(`在频道 ${session.channelId} 尝试撤回消息ID ${selMsgId} 失败。`)
-                }
-              } else {
-                notify(session.text('image-prompt.messages.selecting'))
-              }
-              let selection = await runAISelection(candidates, userInputText, cmdConfig, promptText, aiMaxSelect)
-
-              // AI 判定缺少合适的参考图片 -> 询问用户补充发送
-              if (selection.needUserImage && aiAskOn) {
-                const askText = selection.askMessage || session.text('image-prompt.messages.askimageDefault')
-                await flushNotice()
-                const answer = await askUserForImage(session, quote, askText, aiAskTimeout)
-
-                if (answer) {
-                  const extra = extractImagesFromMessage(answer)
-                  const extraText = extractTextFromMessage(answer)
-                  if (extra.length > 0) {
-                    userImages.push(...extra)
-                    notify(session.text('image-prompt.messages.gotimage'))
-                  }
-                  if (extraText) {
-                    // 带上用户的补充说明重新挑选一次
-                    selection = await runAISelection(
-                      candidates,
-                      `${userInputText}\n用户补充说明：${extraText}`.trim(),
-                      cmdConfig, promptText, aiMaxSelect
-                    )
-                  }
-                } else {
-                  notify(session.text('image-prompt.messages.noask'))
-                }
-              }
-
-              if (selection.ok && selection.picked.length > 0) {
-                images.push(...selection.picked.map(c => c.url))
-                aiProvidedImages += selection.picked.length
-                for (const c of selection.picked) refDescs.push(`【图库】${c.description || c.url}`)
-                logInfo(`AI 选中参考图片: ${selection.picked.map(c => c.url).join(' , ')} 理由: ${selection.reason}`)
-
-                // 模型看图后给出的特征/画面编排并入绘图提示词（仅识别图片模式）
-                if (selector.vision === true && selector.appendHint !== false && selection.hint) {
-                  const hintKey = selection.picked.length > 1 ? 'hintscene' : 'hintsingle'
-                  promptText = `${promptText}\n\n${session.text(`image-prompt.messages.${hintKey}`, [selection.hint])}`
-                  logInfo(`AI 看图得到的${selection.picked.length > 1 ? '画面编排' : '关键特征'}: ${selection.hint}`)
-                }
-
-                if (selector.notify) {
-                  selectionNote = '\n' + session.text('image-prompt.messages.selected', [
-                    selection.picked.map((c, i) => `${i + 1}. ${c.description || c.url}`).join('\n')
-                  ])
-                  if (selection.recalled && selection.total) {
-                    selectionNote += '\n' + session.text('image-prompt.messages.recalled', [selection.total, selection.recalled])
-                  }
-                }
-                // 选图模型自己给出的「画面上要出现的文字」，后面交给浏览器渲染成参考图
-                if (selection.renderText) {
-                  aiRenderText = selection.renderText
-                  logInfo(`选图模型给出需要渲染的文字: ${aiRenderText.replace(/\n/g, ' / ')}`)
-                }
-              } else if (selection.ok && selection.picked.length === 0) {
-                // 打分制判定「图库确实没有合适的图」：如实告诉用户，**不**回退成
-                // 「把候选全塞进去」—— 那正是以前「乱选参考图」的根源。
-                // 说明文字留在 selectionNote 里，后面无论是询问用户补图、
-                // 还是最终因为一张图都没有而中止，用户都能看到原因。
-                logInfo(`[${cmdConfig.name}] 没有参考图达到阈值：${selection.reason}`)
-                if (selector.notify) {
-                  selectionNote = '\n' + session.text('image-prompt.messages.nomatch', [
-                    selection.reason || '无匹配',
-                  ])
-                }
-              } else if (!selection.ok) {
-                ctx.logger.warn(`[${cmdConfig.name}] AI 选图失败，fallbackOnError=${selector.fallbackOnError}`)
-                if (selector.fallbackOnError) {
-                  images.push(...candidates.map(c => c.url))
-                  aiProvidedImages += candidates.length
-                }
-                // 无论是否回退，都告知用户选图未生效及原因
-                if (selector.notify) {
-                  selectionNote = '\n' + session.text(
-                    selector.fallbackOnError
-                      ? 'image-prompt.messages.selectfailed'
-                      : 'image-prompt.messages.selectfailedNoFallback',
-                    [selection.error || '未知原因']
-                  )
-                }
-              }
-            } else if (aiAskOn && declaredGroups.length > 0) {
-              // 指令声明了参考图片组，但组内没有任何可用图片 -> 直接询问用户发送
-              await flushNotice()
-              const answer = await askUserForImage(
-                session,
-                quote,
-                session.text('image-prompt.messages.askimageDefault'),
-                aiAskTimeout
-              )
-              if (answer) {
-                const extra = extractImagesFromMessage(answer)
-                if (extra.length > 0) {
-                  userImages.push(...extra)
-                  notify(session.text('image-prompt.messages.gotimage'))
-                }
-              } else {
-                notify(session.text('image-prompt.messages.noask'))
-              }
-            }
-          }
-
-          // 收集用户提供的图片（不包括默认图片与 AI 选中的参考图）
-          const sessionImages = extractImagesFromSession(session)
-          const extractedImages = [...sessionImages, ...userImages]
-          images.push(...extractedImages)
-          extractedImages.forEach((_, i) => refDescs.push(`【你发送的】第 ${i + 1} 张`))
-
-          // 计算还需要用户提供的图片数量（AI 选中的参考图也算数，已有图就不再追问）
-          const providedImages = extractedImages.length + aiProvidedImages
-          const remainingImages = Math.max(0, maxImages - providedImages)
-          if (aiProvidedImages > 0 && remainingImages === 0) {
-            logInfo(`AI 已提供 ${aiProvidedImages} 张参考图，不再要求用户发送图片`)
-          }
-
-          // 如果还需要用户提供图片，等待用户发送
-          if (remainingImages > 0) {
-            await flushNotice()
-            const [msgId] = await session.send(
-              session.text("image-prompt.messages.waitpromptmultiple", [waitTimeout, remainingImages])
-            )
-
-            try {
-              for (let i = 0; i < remainingImages; i++) {
-                const promptContent = await session.prompt(waitTimeout * 1000)
-                if (promptContent !== undefined) {
-                  const newImages = extractImagesFromMessage(promptContent)
-                  images.push(...newImages)
-                  newImages.forEach(() => refDescs.push('【你发送的】补发的图'))
-                } else {
-                  break
-                }
-              }
-            } finally {
-              try {
-                await session.bot.deleteMessage(session.channelId, msgId)
-              } catch {
-                ctx.logger.warn(`在频道 ${session.channelId} 尝试撤回消息ID ${msgId} 失败。`)
-              }
-            }
-          }
-
-          // ================== 文字渲染参考图 ==================
-          // 优先级：手动「渲染文字」指令暂存的 > 选图模型自己写出来的台词 > 从提示词里正则识别的
-          // 渲染结果只给绘图模型用（选图模型自己知道写了什么，不需要再发回去）
-          let textRef: { file: { data: any, mime: string }, text: string } | null = null
-          if (config.textRender?.enabled) {
-            textRef = await resolveTextReference(session, promptText, userInputText, aiRenderText)
-            if (textRef) {
-              const preview = textRef.text.length > 40 ? `${textRef.text.slice(0, 40)}…` : textRef.text
-              selectionNote += '\n' + session.text('image-prompt.messages.textrenderAttached', [preview])
-              // 提醒绘图模型：画面上的文字以参考图为准，不要自己胡编字形
-              promptText = `${promptText}\n\nText in the image must be rendered exactly as shown in the attached text-reference image; copy the glyphs precisely, never distort or invent characters.`
-              logInfo('已附加文字渲染参考图')
-              if (config.textRender?.sendPreview !== false) {
-                await reply(session, [session.text('image-prompt.messages.textrenderPreview'), h.image(textRef.file.data, 'image/png')])
-              }
-            }
-          }
-
-          // 检查是否有图片（文字参考图也算一张图）
-          if (images.length === 0 && !textRef) {
-            // 带上选图说明：图库里没有匹配时不至于只丢一句「请提供至少一张图片」，
-            // 用户能马上知道是「图库没匹配上」还是「自己忘了发图」。
-            await reply(session, [session.text("image-prompt.messages.needimages") + selectionNote])
-            return
-          }
-
-          logInfo(images)
-
-          // 回显优化后的提示词：合并模式下要纯文本的围栏（和上面几条合成一条 markdown）
-          const promptEcho = config.showPrompt === false
-            ? ''
-            : buildPromptBlock(promptText, config.promptMaxLength || 4000)
-
-          // 开画前是否要用户确认：指令级 'on'/'off' 覆盖全局，'follow'/未填跟随全局
-          const confirmMode = cmdConfig.confirmBeforeDraw
-          const confirmOn = confirmMode === 'off' || confirmMode === false
+          // 该指令是否走 agent：指令级 'on'/'off' 覆盖全局，'follow'/未填跟随全局
+          const agentMode = cmdConfig.agent
+          const agentOn = agentMode === 'off' || agentMode === false
             ? false
-            : confirmMode === 'on' || confirmMode === true
+            : agentMode === 'on' || agentMode === true
               ? true
-              : config.confirmBeforeDraw !== false
-          const confirmTimeout = typeof config.confirmTimeout === 'number' ? config.confirmTimeout : 60
+              : config.agent?.enabled !== false
 
           try {
-            if (config.mergeNotifications === false) {
-              await reply(session, [session.text('image-prompt.messages.processing') + selectionNote
-                + (optimizeFailed ? '\n' + session.text('image-prompt.messages.optimizefailed') : '')])
-              if (promptEcho) {
-                await session.send([supportsMarkdown(session.platform) ? h('markdown', promptEcho) : promptEcho])
-              }
-            } else {
-              // 攒成一条：状态说明 + 提示词代码块（围栏独占一行，不会被前文顶到行中）
-              notify(session.text('image-prompt.messages.processing') + selectionNote
-                + (optimizeFailed ? '\n' + session.text('image-prompt.messages.optimizefailed') : ''))
-              notify(promptEcho)
-            }
-
-            // 下载所有图片
-            const files = await Promise.all(
-              images.map(src => ctx.http.file(src).catch(err => {
-                ctx.logger.error(`下载图片失败: ${src}`, err)
-                return null
-              }))
-            ).then(results => results.filter(Boolean))
-
-            // 文字参考图直接以字节并入，不需要再下载
-            if (textRef) files.push(textRef.file)
-
-            if (files.length === 0) {
-              await reply(session, [session.text("image-prompt.messages.invalidimage")])
+            if (agentOn) {
+              const finalText = await runAgentTurn(session, cmdConfig, userInputText, defaultImageUrls)
+              if (finalText) await reply(session, [finalText])
               return
             }
-
-            // ============ 开画前确认 ============
-            // 到这一步 AI 已经把参考图挑完了。直接把画发出去太亏 —— 万一挑错，
-            // 用户只能白等一张图。所以先把「这次会参考哪几张」摆出来，回复「确认」才开画。
-            if (confirmOn) {
-              const refList = refDescs.length
-                ? refDescs.map((desc, i) => `${i + 1}. ${desc}`).join('\n')
-                : `（图库里没有匹配的参考图，将按提示词生成，共 ${files.length} 张输入）`
-              notify(session.text('image-prompt.messages.confirmask', [
-                refList,
-                confirmTimeout > 0 ? String(confirmTimeout) : '不限',
-              ]))
-              // 必须先把清单发出去：用户得知道自己在确认什么
-              await flushNotice()
-              const confirmed = await waitForConfirm(session, confirmTimeout)
-              if (!confirmed) {
-                await reply(session, [session.text('image-prompt.messages.confirmcancel')])
-                return
-              }
-              notify(session.text('image-prompt.messages.confirmok'))
-            }
-
-            // 后台绘图：先把消息还给用户，出图在后台跑，完成后主动推送
-            if (config.backgroundDrawing?.enabled) {
-              const snapshot = {
-                bot: session.bot,
-                channelId: session.channelId,
-                guildId: session.guildId,
-                messageId: session.messageId,
-                promptText,
-                commandName: cmdConfig.name,
-                texts: {
-                  done: session.text('image-prompt.messages.bgdone'),
-                  failed: session.text('image-prompt.messages.failed'),
-                  error: session.text('image-prompt.messages.error')
-                }
-              }
-              const queued = enqueueDrawJob(snapshot, files)
-              // 只补「已开始后台绘图」这一行。**不要**再把 selectionNote / promptEcho
-              // 加一遍 —— 上面已经进过 noticeLines 队列了，再加就会连同提示词一起发两遍。
-              notify(`${session.text('image-prompt.messages.bgstart', [files.length])}${queued > 0 ? session.text('image-prompt.messages.bgqueue', [queued]) : ''}`)
-              await flushNotice()
-              return
-            }
-
-            // 合并消息要在**开始画之前**发：不然整个绘图期间一条消息都没有，用户会以为卡住了
-            await flushNotice()
-
-            const result = await generateFigureImage(files, promptText)
-
-            if (result) {
-              await saveToGallery(result, buildGalleryDescription(promptText, userInputText), cmdConfig.name)
-              await sendResultImage(session, result, cmdConfig.name)
-              return
-            } else {
-              return session.text('image-prompt.messages.failed')
-            }
+            return await runDirectFlow(session, cmdConfig, userInputText, defaultImageUrls)
           } catch (error) {
-            ctx.logger.error(`[${cmdConfig.name}] 处理图片时发生错误:`, error)
+            ctx.logger.error(`[${cmdName}] 处理图片时发生错误:`, error)
             return session.text('image-prompt.messages.error')
           }
         })
     }
 
+    // ==================== Agent 模式 ====================
+    // 参考 NeoBot 的 runtime/agent.py：
+    //   插件只负责「把工具交给模型 + 老实执行模型要调的工具」，
+    //   查不查图库、要不要追问、什么时候开画，全部由模型自己决定。
+    // ===================================================
+
+    /**
+     * 跑一次 agent：把「指令 + 用户说的话 + 可用工具」交给模型，让它自己决定流程。
+     * @returns 模型最后想对用户说的话（空字符串表示它已经把图发出去了，不需要再补一句）
+     */
+    async function runAgentTurn(
+      session: Session,
+      cmdConfig: CommandConfig['nested']['commands'][number],
+      userInputText: string,
+      defaultImageUrls: string[]
+    ): Promise<string> {
+      const agentCfg: AgentConfig = config.agent || ({} as AgentConfig)
+      const maxIterations = agentCfg.maxIterations || 8
+      const askTimeout = agentCfg.askTimeout || 120
+      const maxSelect = agentCfg.maxSelect || 3
+      const searchLimit = agentCfg.searchLimit || 12
+      const historyTurns = typeof agentCfg.historyTurns === 'number' ? agentCfg.historyTurns : 6
+
+      // ---- 参考图登记表：模型只能用它拿到的编号去引用图片 ----
+      const registry = new Map<string, RefEntry>()
+      const idByUrl = new Map<string, string>()
+      let seq = 0
+      const register = (source: RefEntry['source'], url: string, description: string, group: string): string => {
+        const existed = idByUrl.get(url)
+        if (existed) return existed
+        seq++
+        const id = `ref${seq}`
+        registry.set(id, { id, url, description, group, source })
+        idByUrl.set(url, id)
+        return id
+      }
+
+      const pool = collectCandidates(cmdConfig, defaultImageUrls)
+      for (const item of pool) register('gallery', item.url, item.description, item.group)
+      // 指令默认图 = 指令作者配的「必带参考图」，始终带上，不用模型再填
+      const baseIds = (defaultImageUrls || []).filter(Boolean).map(url => register('cmd', url, '', '指令默认图'))
+      const userIds = extractImagesFromSession(session).map(url => register('user', url, '', '用户发送'))
+
+      logInfo(`[${cmdConfig.name}] agent 启动：可搜索参考图 ${pool.length} 张，默认图 ${baseIds.length} 张，用户随消息发的图 ${userIds.length} 张`)
+
+      // ---- 历史（同一频道记住最近几轮，让「再画一张」能接上）----
+      const historyKey = agentHistoryKey(session)
+      const history = historyTurns > 0 ? (agentHistories.get(historyKey) || []).slice() : []
+      const newHistory: any[] = []
+      const remember = (msg: any) => { if (historyTurns > 0) newHistory.push(msg) }
+      remember({ role: 'user', content: userInputText || '（用户没有附加说明）' })
+
+      const messages: any[] = [
+        { role: 'system', content: buildAgentSystemPrompt(cmdConfig, userInputText, userIds.length, pool.length, baseIds, agentCfg) },
+        ...history,
+        { role: 'user', content: userInputText ? userInputText : '（用户没有附加说明，请按指令自带的提示词来）' },
+      ]
+      if (history.length) logInfo(`agent 带上 ${history.length} 条历史上下文`)
+
+      const tools = buildAgentTools()
+      let toolsSupported = true
+      let finalText = ''
+      let drew = false
+      let failed = ''
+
+      for (let iteration = 0; iteration < maxIterations; iteration++) {
+        if (!isActive || !ctx.scope.isActive) break
+
+        const res = await requestAgentChat(messages, toolsSupported ? tools : undefined)
+        if (!res.ok) {
+          ctx.logger.warn(`[${cmdConfig.name}] agent 第 ${iteration + 1} 轮请求失败: ${res.error}`)
+          if (toolsSupported && res.toolRejected) {
+            // 接口不认 tools 参数（模型不支持 function calling）：改用「一行 JSON」协议重来
+            ctx.logger.warn('接口不接受 tools 参数，改用「一行 JSON」工具协议重试')
+            toolsSupported = false
+            messages.push({ role: 'system', content: AGENT_JSON_FALLBACK_RULE })
+            continue
+          }
+          failed = res.error || '未知原因'
+          break
+        }
+
+        messages.push(res.message)
+        if (agentCfg.debugLog) {
+          ctx.logger.info(`[${cmdConfig.name}] agent 第 ${iteration + 1} 轮: ${previewJson(res.message, 600)}`)
+        }
+
+        // 优先用原生 tool_calls；没有的话再看模型是不是用「一行 JSON」在调工具
+        const calls = res.toolCalls.length
+          ? res.toolCalls
+          : parseJsonToolCall(res.content, AGENT_TOOL_NAMES)
+
+        if (!calls.length) {
+          finalText = res.content
+          break
+        }
+
+        for (const call of calls) {
+          const name = String(call?.name || '').trim()
+          const output = await runAgentTool(name, call?.args)
+          if (name === 'draw' && /"ok"\s*:\s*true/.test(output)) drew = true
+          messages.push(
+            call?.id
+              ? { role: 'tool', tool_call_id: call.id, content: output }
+              : { role: 'user', content: `工具 ${name} 返回：\n${output}` }
+          )
+          if (agentCfg.debugLog) {
+            ctx.logger.info(`[${cmdConfig.name}] 工具 ${name}(${previewJson(call?.args, 300)}) -> ${previewJson(output, 400)}`)
+          }
+        }
+      }
+
+      if (!finalText && failed) finalText = session.text('image-prompt.messages.agentfailed', [failed])
+      if (!finalText && !drew) finalText = session.text('image-prompt.messages.agentnoresult')
+
+      remember({ role: 'assistant', content: finalText || '（已经把图发出去了）' })
+      if (historyTurns > 0) {
+        agentHistories.set(historyKey, [...history, ...newHistory].slice(-(historyTurns * 2)))
+        // 频道太多时清一下，避免无限增长
+        if (agentHistories.size > 200) agentHistories.clear()
+      }
+      return finalText
+
+      // ---------------- 工具实现 ----------------
+
+      async function runAgentTool(name: string, args: any): Promise<string> {
+        switch (name) {
+          case 'gallery_search': return toolGallerySearch(args)
+          case 'ask_user': return toolAskUser(args)
+          case 'draw': return toolDraw(args)
+          default: return JSON.stringify({ ok: false, error: `没有叫「${name}」的工具，可用的是 gallery_search / ask_user / draw` })
+        }
+      }
+
+      /** 搜图库：关键词由模型自己拟，插件只做文本匹配排序 */
+      function toolGallerySearch(args: any): string {
+        const keyword = String(args?.keyword ?? args?.query ?? '').trim()
+        const limit = Number(args?.limit) > 0 ? Number(args.limit) : searchLimit
+        const hits = keyword ? searchGallery(pool, keyword, limit) : pool.slice(0, limit)
+        if (!hits.length) {
+          return JSON.stringify({
+            ok: true, keyword, total: pool.length, matched: 0, items: [],
+            note: '没有搜到。换个更宽的关键词再试一次；确实没有就如实告诉用户「图库里没有这个立绘」',
+          })
+        }
+        return JSON.stringify({
+          ok: true, keyword, total: pool.length, matched: hits.length,
+          items: hits.map(item => ({
+            id: idByUrl.get(item.url) || '',
+            group: item.group,
+            description: item.description || '（无描述）',
+          })),
+        })
+      }
+
+      /** 提问并等用户的下一条消息（图也会一起带回来） */
+      async function toolAskUser(args: any): Promise<string> {
+        const question = cleanAskMessage(args?.question ?? args?.text ?? args?.message)
+        if (!question) return JSON.stringify({ ok: false, error: 'question 不能为空' })
+
+        try {
+          await sendNotice(session, question)
+        } catch (error) {
+          ctx.logger.warn(`agent 提问发送失败: ${error}`)
+        }
+
+        let answer: string | undefined
+        try {
+          answer = await session.prompt((askTimeout > 0 ? askTimeout : 120) * 1000)
+        } catch (error) {
+          ctx.logger.warn(`等待用户回复时出错: ${error}`)
+        }
+
+        remember({ role: 'assistant', content: question })
+        if (answer === undefined || answer === null) {
+          return JSON.stringify({
+            ok: false, timeout: true,
+            note: `用户 ${askTimeout} 秒内没有回复。当成「他不改了」，按现有信息继续，或者直接结束这次流程`,
+          })
+        }
+
+        const text = extractTextFromMessage(answer)
+        const images = extractImagesFromMessage(answer)
+        const ids = images.map(url => register('user', url, '', '用户发送'))
+        remember({ role: 'user', content: text || (ids.length ? `（用户发了 ${ids.length} 张图片）` : '（用户什么都没说）') })
+        logInfo(`agent 提问「${question}」-> 用户回复: ${text || '（无文字）'}，图片 ${ids.length} 张`)
+
+        return JSON.stringify({
+          ok: true,
+          text,
+          images: ids.map((id, i) => ({ id, note: `用户这次发的第 ${i + 1} 张图` })),
+        })
+      }
+
+      /** 真正开画 */
+      async function toolDraw(args: any): Promise<string> {
+        const prompt = String(args?.prompt ?? '').trim()
+        if (!prompt) return JSON.stringify({ ok: false, error: 'prompt 不能为空' })
+
+        const rawRefs = Array.isArray(args?.references)
+          ? args.references
+          : typeof args?.references === 'string'
+            ? args.references.split(/[,，\s]+/)
+            : (args?.reference_id ? [args.reference_id] : [])
+
+        const { ids, unknown } = resolveReferences(rawRefs, registry)
+        const wanted: string[] = []
+        const pushId = (id: string) => { if (id && !wanted.includes(id)) wanted.push(id) }
+        baseIds.forEach(pushId)
+        ids.forEach(pushId)
+        const capped = wanted.slice(0, maxSelect)
+        const imageUrls = capped.map(id => registry.get(id)?.url).filter(Boolean) as string[]
+
+        const finalPrompt = args?.negative_prompt
+          ? `${prompt}\n\nNegative prompt: ${String(args.negative_prompt).trim()}`
+          : prompt
+
+        logInfo(`[${cmdConfig.name}] agent 开画：参考图 ${capped.join(', ') || '（无，纯文生图）'}`)
+        const res = await drawWithFiles(session, cmdConfig, finalPrompt, imageUrls, userInputText, { requireInput: false })
+
+        return JSON.stringify({
+          ok: res.ok,
+          references: capped,
+          ...(unknown.length ? { unknown } : {}),
+          ...(res.ok
+            ? { note: '图已经发到群里了，回一句简短说明即可，不要再问「还要我做什么」' }
+            : { error: res.error === 'invalidimage' ? '这些参考图一张都下载不下来，检查链接还能不能访问' : '绘图接口没有返回图片' }),
+        })
+      }
+    }
+
+    /** 组装 agent 的系统提示词：可配置的规则 + 本次上下文 */
+    function buildAgentSystemPrompt(
+      cmdConfig: CommandConfig['nested']['commands'][number],
+      userInputText: string,
+      imageCount: number,
+      refCount: number,
+      baseIds: string[],
+      agentCfg: AgentConfig
+    ): string {
+      const instructions = renderAgentInstructions(agentCfg.instructions || DEFAULT_AGENT_INSTRUCTIONS, {
+        command: cmdConfig.name || '',
+        prompt: cmdConfig.prompt || '',
+        userInput: userInputText || '',
+        imageCount,
+        refCount,
+        confirmRule: agentCfg.confirmBeforeDraw !== false ? AGENT_CONFIRM_RULE_ON : AGENT_CONFIRM_RULE_OFF,
+      })
+
+      const lines = ['', '## 本次上下文',
+        `- 绘图指令：${cmdConfig.name}`,
+        `- 指令自带的提示词：${cmdConfig.prompt || '（空，这是自定义指令）'}`,
+        `- 用户这次说的话：${userInputText || '（用户没说话）'}`,
+        `- 用户随消息发的图：${imageCount} 张${imageCount ? '（编号见下方，可以直接写进 draw 的 references）' : ''}`,
+        `- 图库里可以搜到的参考图：${refCount} 张`,
+      ]
+      if (baseIds.length) lines.push(`- 指令默认参考图（已自动带上，不用再填）：${baseIds.join('、')}`)
+      if (cmdConfig.custom) lines.push('- 这是自定义指令：用户没说清楚要画什么时，先用 ask_user 问一句')
+
+      return instructions + lines.join('\n')
+    }
+
+    /** 发一次 agent 请求，返回助手消息与它想调的工具 */
+    async function requestAgentChat(
+      messages: any[],
+      tools: any[] | undefined
+    ): Promise<{ ok: boolean, message?: any, content: string, toolCalls: any[], error?: string, toolRejected?: boolean }> {
+      const agentCfg: AgentConfig = config.agent || ({} as AgentConfig)
+      const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
+      const model = agentCfg.model || selector.model || 'Qwen/Qwen2.5-7B-Instruct'
+      const url = agentCfg.baseUrl || selector.baseUrl || config.baseUrl
+      const apiKey = agentCfg.apiKey || selector.apiKey || config.apiKey
+      // agent 要用的是**对话**模型。接口地址一个都没填时会落到绘图接口上，
+      // 而绘图模型（gpt-image 之类）根本不会聊天/调工具，这里提前说清楚。
+      if (!agentCfg.baseUrl && !selector.baseUrl && !agentUrlWarned) {
+        agentUrlWarned = true
+        ctx.logger.warn('Agent 用的是绘图接口地址（「AI 模型接口 → 对话接口地址」留空了）。绘图模型不会聊天也不会调工具，请在「AI 模型接口」或「Agent 配置」里单独填一个支持工具调用的对话模型地址')
+      }
+      const timeout = (agentCfg.timeout || selector.timeout || 60) * 1000
+      const temperature = typeof agentCfg.temperature === 'number'
+        ? agentCfg.temperature
+        : (typeof selector.temperature === 'number' ? selector.temperature : 0.3)
+      const maxTokens = typeof agentCfg.maxTokens === 'number' ? agentCfg.maxTokens : 8000
+      const maxRetry = typeof selector.maxRetries === 'number' ? selector.maxRetries : 2
+      const baseInterval = selector.retryInterval || 3000
+      const maxWaitMs = (typeof selector.retryMaxWait === 'number' ? selector.retryMaxWait : 20) * 1000
+      const param = resolveTokenParam(model, selector.maxTokensParam)
+
+      const body: any = { model, messages, temperature, max_tokens: maxTokens }
+      if (tools && tools.length) {
+        body.tools = tools
+        body.tool_choice = 'auto'
+      }
+
+      let lastError = '未知错误'
+      for (let i = 0; i <= maxRetry; i++) {
+        if (!isActive || !ctx.scope.isActive) break
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+        try {
+          const response = await ctx.http.post(url, withTokenParam(body, param), { headers, timeout })
+          return { ok: true, ...pickAgentMessage(response) }
+        } catch (error) {
+          const status = error?.response?.status ?? error?.status ?? error?.code
+          const serverMessage = extractServerMessage(error)
+          const raw = String(error?.message || error || '')
+          lastError = describeSelectorError(status, serverMessage, raw)
+          ctx.logger.warn(`agent 请求失败 (${i + 1}/${maxRetry + 1}): ${lastError}`)
+          if (i >= maxRetry) break
+          if (!isRetryableStatus(status)) {
+            // 400/401/404 这类永久性错误重试没意义。顺便判断是不是「不认 tools」
+            break
+          }
+          const delay = computeRetryDelay(status, parseRetryAfterHeader(error?.response?.headers), baseInterval, i)
+          if (maxWaitMs > 0 && delay > maxWaitMs) break
+          await sleep(delay)
+        }
+      }
+
+      return {
+        ok: false,
+        content: '',
+        toolCalls: [],
+        error: lastError,
+        toolRejected: !!tools && /tool|function|工具/i.test(lastError),
+      }
+    }
+
+    // ---------------- 绘图（agent 与直连模式共用） ----------------
+
+    /** 下载若干张图，失败的单张丢弃（不至于一张坏图毁掉整次请求） */
+    async function downloadFiles(urls: string[]): Promise<any[]> {
+      const tasks = (urls || []).map(src => ctx.http.file(src).catch(err => {
+        ctx.logger.error(`下载图片失败: ${src}`, err)
+        return null
+      }))
+      return (await Promise.all(tasks)).filter(Boolean)
+    }
+
+    /**
+     * 下载 → 附文字参考图 → 回显提示词 → 出图并发出去。
+     * agent 的 draw 工具和「不走 agent」的直连流程都走这里。
+     */
+    async function drawWithFiles(
+      session: Session,
+      cmdConfig: CommandConfig['nested']['commands'][number],
+      promptText: string,
+      imageUrls: string[],
+      userInputText: string,
+      options: { optimizeFailed?: boolean, requireInput?: boolean } = {}
+    ): Promise<{ ok: boolean, error?: string, url?: string }> {
+      const commandName = cmdConfig.name
+      const requireInput = options.requireInput !== false
+      const files = await downloadFiles(imageUrls)
+      let text = promptText
+
+      // 文字渲染参考图（防中文崩字）
+      if (config.textRender?.enabled) {
+        const textRef = await resolveTextReference(session, text, userInputText, '')
+        if (textRef) {
+          files.push(textRef.file)
+          // 提醒绘图模型：画面上的文字以参考图为准，不要自己胡编字形
+          text = `${text}\n\nText in the image must be rendered exactly as shown in the attached text-reference image; copy the glyphs precisely, never distort or invent characters.`
+          logInfo('已附加文字渲染参考图')
+          if (config.textRender?.sendPreview !== false) {
+            await reply(session, [session.text('image-prompt.messages.textrenderPreview'), h.image(textRef.file.data, 'image/png')])
+          }
+        }
+      }
+
+      if (files.length === 0 && requireInput) return { ok: false, error: 'invalidimage' }
+
+      // 回显这次用的提示词（顺便当作「我开始画了」的信号）
+      if (config.showPrompt !== false) {
+        const echo = buildPromptBlock(text, config.promptMaxLength || 4000)
+        if (echo) {
+          await sendNotice(session, options.optimizeFailed
+            ? `${session.text('image-prompt.messages.optimizefailed')}\n${echo}`
+            : echo)
+        }
+      }
+
+      // 后台绘图：先把消息还给用户，出图在后台跑，完成后主动推送
+      if (config.backgroundDrawing?.enabled) {
+        const snapshot = {
+          bot: session.bot,
+          channelId: session.channelId,
+          guildId: session.guildId,
+          messageId: session.messageId,
+          promptText: text,
+          commandName,
+          texts: {
+            done: session.text('image-prompt.messages.bgdone'),
+            failed: session.text('image-prompt.messages.failed'),
+            error: session.text('image-prompt.messages.error'),
+          },
+        }
+        const queued = enqueueDrawJob(snapshot, files)
+        await sendNotice(session, `${session.text('image-prompt.messages.bgstart', [files.length])}${queued > 0 ? session.text('image-prompt.messages.bgqueue', [queued]) : ''}`)
+        return { ok: true }
+      }
+
+      const result = await generateFigureImage(files, text)
+      if (!result) return { ok: false, error: 'failed' }
+
+      await saveToGallery(result, buildGalleryDescription(text, userInputText), commandName)
+      await sendResultImage(session, result, commandName)
+      return { ok: true, url: result }
+    }
+
+    /** 发一条状态说明（支持的平台用 markdown，省得长文被拆） */
+    async function sendNotice(session: Session, text: any): Promise<void> {
+      const value = String(text ?? '').trim()
+      if (!value) return
+      await reply(session, [supportsMarkdown(session.platform) ? h('markdown', value) : value])
+    }
+
+    /** 不走 agent 的直连流程：指令提示词 + 用户附加需求 + 用户/默认图片，直接画 */
+    async function runDirectFlow(
+      session: Session,
+      cmdConfig: CommandConfig['nested']['commands'][number],
+      userInputText: string,
+      defaultImageUrls: string[]
+    ) {
+      const waitTimeout = cmdConfig.waitTimeout || config.defaultWaitTimeout
+      const maxImages = cmdConfig.maxImages || 0
+      let promptText = cmdConfig.prompt
+      let optimizeFailed = false
+
+      if (userInputText && config.appendUserInput !== false) {
+        promptText = mergePrompt(promptText, userInputText, true)
+        logInfo(`已并入用户附加需求: ${userInputText}`)
+        if (config.promptOptimize === 'rewrite') {
+          const optimized = await optimizePromptText(cmdConfig.prompt, userInputText)
+          if (optimized) {
+            promptText = optimized
+            logInfo('提示词已融合重写')
+          } else {
+            ctx.logger.warn('提示词融合重写失败，保留追加后的提示词')
+            optimizeFailed = true
+          }
+        }
+      }
+
+      // 自定义指令：本身没提示词、用户也没给文本 -> 要一句
+      if (cmdConfig.custom && !cmdConfig.prompt && !userInputText) {
+        const [msgId] = await session.send(session.text('image-prompt.messages.customprompt', [waitTimeout]))
+        const userPrompt = await session.prompt(waitTimeout * 1000)
+        try {
+          await session.bot.deleteMessage(session.channelId, msgId)
+        } catch {
+          ctx.logger.warn(`在频道 ${session.channelId} 尝试撤回消息ID ${msgId} 失败。`)
+        }
+        if (!userPrompt) return session.text('image-prompt.messages.needprompt')
+        const text = extractTextFromMessage(userPrompt) || String(userPrompt).trim()
+        promptText = config.promptOptimize === 'rewrite'
+          ? ((await optimizePromptText('', text)) || text)
+          : mergePrompt('', text, true)
+      }
+
+      const images: string[] = [...(defaultImageUrls || []), ...extractImagesFromSession(session)]
+      const remaining = Math.max(0, maxImages - images.length)
+      if (remaining > 0) {
+        const [msgId] = await session.send(
+          session.text('image-prompt.messages.waitpromptmultiple', [waitTimeout, remaining])
+        )
+        try {
+          for (let i = 0; i < remaining; i++) {
+            const answer = await session.prompt(waitTimeout * 1000)
+            if (answer === undefined || answer === null) break
+            images.push(...extractImagesFromMessage(answer))
+          }
+        } finally {
+          try {
+            await session.bot.deleteMessage(session.channelId, msgId)
+          } catch {
+            ctx.logger.warn(`在频道 ${session.channelId} 尝试撤回消息ID ${msgId} 失败。`)
+          }
+        }
+      }
+
+      if (images.length === 0) return session.text('image-prompt.messages.needimages')
+
+      const res = await drawWithFiles(session, cmdConfig, promptText, images, userInputText, { optimizeFailed })
+      if (!res.ok) {
+        return res.error === 'invalidimage'
+          ? session.text('image-prompt.messages.invalidimage')
+          : session.text('image-prompt.messages.failed')
+      }
+    }
     // ============ 后台绘图 ============
     let runningJobs = 0
     const pendingJobs: (() => void)[] = []
@@ -2736,8 +2630,6 @@ export function apply(ctx: Context, config: CommandConfig) {
 
       const { raw, error } = await callSelectorModel(
         content,
-        content,
-        false,
         selector.optimizeMaxTokens || 8000,
         '你是资深的绘图提示词工程师，只输出优化后的提示词正文，不要输出 JSON、解释或 Markdown 代码块。',
         typeof selector.optimizeTemperature === 'number' ? selector.optimizeTemperature : 0.7
@@ -3157,9 +3049,8 @@ export function apply(ctx: Context, config: CommandConfig) {
       const { raw, error } = await requestSelectorModel(url, apiKey, body, timeout)
       if (!raw) {
         ctx.logger.warn(`生成图片描述失败: ${error}`)
-        // 纯文本模型会在这里失败，给出明确指引
-        if (selector.vision !== true && !selector.captionModel) {
-          ctx.logger.warn('生成描述需要支持图片输入的模型：请勾选「选图模型支持识别图片」或单独填写「生成描述用的模型」')
+        if (!selector.captionModel) {
+          ctx.logger.warn('生成描述需要支持图片输入的模型：请在「AI 模型接口 → 生成描述用的模型」单独填一个多模态模型')
         }
         return null
       }
@@ -3214,321 +3105,19 @@ export function apply(ctx: Context, config: CommandConfig) {
       return candidates
     }
 
-    /**
-     * 选图入口。
-     *
-     * 默认走「打分制」（selectionMode = 'score'）：
-     *   需求分析（不给候选）→ 关键词召回 → 逐图显式打分 → 分数够不到阈值就不要
-     * 这套流程的要点是**给模型留退路**：候选项不达标时它可以一张都不选，
-     * 而不是像以前那样被逼着从一堆图里挑一张出来凑数。
-     *
-     * 传 selectionMode = 'legacy' 可回到旧的「候选全量丢给模型挑」逻辑。
-     */
-    async function runAISelection(
-      candidates: CandidateImage[],
-      userInput: string,
-      cmdConfig: CommandConfig['nested']['commands'][number],
-      promptText: string,
-      max: number
-    ): Promise<SelectionResult> {
-      const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
-
-      if (selector.selectionMode !== 'legacy') {
-        return runScoredSelection(candidates, userInput, cmdConfig, promptText, max)
-      }
-
-      const threshold = selector.twoStageThreshold || 12
-      if (selector.twoStage !== false && candidates.length > threshold) {
-        const result = await runTwoStageSelection(candidates, userInput, cmdConfig, promptText, max)
-        // 两级检索没召回任何东西（关键词没命中）时，退回单阶段全量问一次
-        if (result.ok || result.needUserImage) return result
-        ctx.logger.warn('两级检索未召回候选，退回单阶段全量选择')
-      }
-
-      return runSingleStageSelection(candidates, userInput, cmdConfig, promptText, max)
-    }
 
     /**
-     * 打分制选图（默认）：
-     *
-     * 1. 需求分析 —— 只给指令和用户需求，**不给任何候选图**。
-     *    模型没有「可挑的对象」，自然不可能乱选，只会老实说清「这次要什么」。
-     * 2. 本地召回 —— 拿分析出的硬性/加分要素做关键词匹配，把候选池缩到十几张。
-     * 3. 逐图打分 —— 要求模型给**每一张**打 0-100 分，并强制「硬性要素缺失就给低分、
-     *    描述为空一律 0 分、拿不准就打低分」。
-     * 4. 阈值兜底 —— 达不到 minScore 的一律丢弃；一张都不够就如实回「没有合适的图」，
-     *    交给上层去问用户补图，而不是硬塞一张不相关的图进参考。
+     * 发一次对话模型请求（提示词优化、生成描述等纯文本用途）。
+     * agent 循环不走这里（它要拿 tool_calls），走 requestAgentChat。
      */
-    async function runScoredSelection(
-      candidates: CandidateImage[],
-      userInput: string,
-      cmdConfig: CommandConfig['nested']['commands'][number],
-      promptText: string,
-      max: number
-    ): Promise<SelectionResult> {
-      const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
-      const minScore = typeof selector.minScore === 'number' ? selector.minScore : 60
-      const topK = selector.retrievalTopK || 12
-      const respectSkip = selector.respectSkipReference !== false
-
-      // ---- 0. 用户明说「不用参考」就省掉请求 ----
-      if (respectSkip && isSkipReferenceInput(userInput)) {
-        logInfo('用户表示不需要参考图，跳过选图')
-        return { picked: [], needUserImage: false, askMessage: '', reason: '用户表示不需要参考图', ok: true }
-      }
-
-      // ---- 1. 需求分析（不给候选）----
-      const analyzeContent = (selector.analyzePrompt || DEFAULT_ANALYZE_PROMPT)
-        .replace(/\{command\}/g, cmdConfig.name || '')
-        .replace(/\{prompt\}/g, promptText || '')
-        .replace(/\{userInput\}/g, userInput || '（用户未附加说明）')
-
-      const analysisCall = await callSelectorModel(
-        analyzeContent, analyzeContent, false, selector.keywordMaxTokens || 3000,
-        '你是绘图参考图需求分析助手，只输出 JSON，不要挑选图片。'
-      )
-      const analysis = parseAnalysisResult(analysisCall.raw)
-      if (!analysis) {
-        return {
-          picked: [], needUserImage: false, askMessage: '', reason: '', ok: false,
-          error: analysisCall.error || '需求分析没有返回可解析的结果',
-        }
-      }
-      logInfo(`需求分析：主体=${analysis.subject || '（无）'} 硬性=${JSON.stringify(analysis.must)} 加分=${JSON.stringify(analysis.nice)}`)
-
-      if (analysis.skipReference && respectSkip) {
-        logInfo('需求分析判定本次不需要参考图')
-        return {
-          picked: [], needUserImage: false, askMessage: '', reason: '本次不需要参考图',
-          ok: true, keywords: keywordsFromAnalysis(analysis),
-        }
-      }
-
-      // ---- 2. 召回 ----
-      const pool = selector.dedupe === false ? candidates : dedupeCandidates(candidates)
-      const keywords = keywordsFromAnalysis(analysis)
-      const matched = matchCandidatesByKeywords(pool, keywords, topK)
-      // 关键词没命中就退化成「全量截断」：评分阈值会兜住乱选，不会因为召回空就放弃
-      const shortlist = matched.length > 0 ? matched : pool.slice(0, Math.max(topK, 1) * 2)
-      logInfo(`关键词召回 ${shortlist.length}/${pool.length} 张进入打分（关键词：${keywords.join('/') || '无'}）`)
-
-      if (shortlist.length === 0) {
-        return {
-          picked: [], needUserImage: true, askMessage: analysis.needTypes, reason: '候选池里没有图片',
-          ok: true, keywords, recalled: 0, total: pool.length, renderText: analysis.text || undefined,
-        }
-      }
-
-      // ---- 3. 逐图打分（开了识图就把召回图的图片本身一起发过去）----
-      const scoreContent = (selector.scorePrompt || DEFAULT_SCORE_PROMPT)
-        .replace(/\{subject\}/g, analysis.subject || '（未指定）')
-        .replace(/\{must\}/g, analysis.must.length ? analysis.must.join('、') : '（无）')
-        .replace(/\{nice\}/g, analysis.nice.length ? analysis.nice.join('、') : '（无）')
-        .replace(/\{avoid\}/g, analysis.avoid.length ? analysis.avoid.join('、') : '（无）')
-        .replace(/\{candidates\}/g, buildIndexText(shortlist))
-        .replace(/\{max\}/g, String(max))
-
-      const visionOn = selector.vision === true
-      // 识图模式：候选图先自己下载成 base64。直接把原 URL 交给上游，
-      // 上游拉不到（私有 CDN / 防盗链）会整条请求 400，连文字描述一起废掉。
-      const inlined = visionOn
-        ? await inlineCandidateImages(shortlist, selector.visionMaxImages || 6)
-        : undefined
-      const scoreUserContent = buildSelectorContent(
-        scoreContent, shortlist, visionOn, selector.visionMaxImages || 6, inlined
-      )
-      const scoreCall = await callSelectorModel(
-        scoreUserContent, scoreContent, visionOn, selector.selectMaxTokens || 8000,
-        '你是参考图打分助手，只输出 JSON。'
-      )
-      const scored = parseScoreResult(scoreCall.raw, shortlist)
-
-      if (scored.length === 0) {
-        return {
-          picked: [], needUserImage: false, askMessage: '', reason: '', ok: false,
-          keywords, recalled: shortlist.length, total: pool.length,
-          error: scoreCall.error || '打分阶段没有拿到有效的分数',
-        }
-      }
-
-      // ---- 4. 阈值兜底 ----
-      const { picked, best, passed } = selectByScore(scored, shortlist, minScore, max)
-      const detail = scored
-        .slice()
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 5)
-        .map(item => `${item.index}:${item.score}分(${item.why || '-'})`)
-        .join('  ')
-      logInfo(`逐图打分（阈值 ${minScore}）：最高 ${best} 分，达标 ${passed} 张，选中 ${picked.length} 张 | ${detail}`)
-
-      const hint = String(extractJsonObject(scoreCall.raw)?.hint || '').trim() || undefined
-
-      return {
-        picked,
-        // 一张都不达标 = 图库里确实没有合适的 -> 让上层去问用户补图，而不是硬塞
-        needUserImage: picked.length === 0,
-        askMessage: picked.length === 0 ? (analysis.needTypes || '') : '',
-        reason: picked.length
-          ? `命中需求（最高 ${best} 分）`
-          : `没有图达到 ${minScore} 分门槛（最高只有 ${best} 分）`,
-        ok: true,
-        keywords,
-        recalled: shortlist.length,
-        total: pool.length,
-        renderText: analysis.text || undefined,
-        hint: visionOn && selector.appendHint !== false ? hint : undefined,
-      }
-    }
-
-    /**
-     * 识图模式用：把候选图自己下载成 base64 data URL。
-     *
-     * 不能直接把图片链接丢给上游模型 —— 上游是它自己去下载的，
-     * 碰到私有 CDN / 防盗链（实测 pro.filesystem.site 就是）就会返回
-     * 「Failed to download image from ...」并让**整条请求 400**，
-     * 于是只能退回纯文字选图，识图功能白开。
-     *
-     * 下载失败或图片过大的，对应位置留 undefined → buildSelectorContent 只发文字描述。
-     * @returns 与 candidates 同下标的 data URL 数组
-     */
-    async function inlineCandidateImages(
-      candidates: CandidateImage[],
-      max: number
-    ): Promise<(string | undefined)[]> {
-      const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
-      const cap = (selector.visionMaxImageBytes || 4) * 1024 * 1024
-      const out: (string | undefined)[] = new Array(candidates.length)
-      const limit = max > 0 ? Math.min(max, candidates.length) : candidates.length
-
-      await Promise.all(candidates.map(async (candidate, index) => {
-        if (index >= limit) return
-        const brief = (candidate.url || '').slice(0, 80)
-        try {
-          const file = await ctx.http.file(candidate.url)
-          const data = file?.data
-          if (!data) throw new Error('没有拿到图片数据')
-          const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data)
-          if (!buffer.length) throw new Error('图片是空的')
-          if (buffer.length > cap) {
-            ctx.logger.warn(
-              `候选图 ${(buffer.length / 1048576).toFixed(1)}MB 超过上限 `
-              + `${(cap / 1048576).toFixed(1)}MB，识图时只发文字描述：${brief}`
-            )
-            return
-          }
-          out[index] = `data:${file?.mime || 'image/jpeg'};base64,${buffer.toString('base64')}`
-        } catch (error) {
-          ctx.logger.warn(`候选图下载失败，识图时只发文字描述：${brief}（${error}）`)
-        }
-      }))
-
-      const ok = out.filter(Boolean).length
-      logInfo(`识图候选图已内联 ${ok}/${limit} 张（其余只发文字描述）`)
-      return out
-    }
-
-    /** 候选图片索引文本 */
-    function buildIndexText(candidates: CandidateImage[]): string {
-      return candidates
-        .map((c, i) => `[${i + 1}] 所属组：${c.group} | 描述：${c.description || '（无描述）'}`)
-        .join('\n')
-    }
-
-    /**
-     * 两级检索：
-     * 第一级 让模型产出关键词 + 粗筛编号 → 本地文本匹配召回
-     * 第二级 只把召回的少量候选交给模型精排（识图模式下也只有这几张需要发图）
-     */
-    async function runTwoStageSelection(
-      candidates: CandidateImage[],
-      userInput: string,
-      cmdConfig: CommandConfig['nested']['commands'][number],
-      promptText: string,
-      max: number
-    ): Promise<SelectionResult> {
-      const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
-      const topK = selector.retrievalTopK || 12
-
-      // ---- 第一级：关键词 ----
-      const keywordContent = (selector.keywordPrompt || DEFAULT_KEYWORD_PROMPT)
-        .replace(/\{index\}/g, buildIndexText(candidates))
-        .replace(/\{userInput\}/g, userInput || '（用户未附加说明）')
-        .replace(/\{topK\}/g, String(topK))
-        .replace(/\{command\}/g, cmdConfig.name || '')
-        .replace(/\{prompt\}/g, promptText || '')
-
-      const { raw, error } = await callSelectorModel(
-        keywordContent, keywordContent, false, selector.keywordMaxTokens || 3000
-      )
-      const first = parseSelection(raw, candidates, topK)
-      logInfo(`两级检索·关键词: ${JSON.stringify(first.keywords || [])} 粗筛: ${first.picked.length}`)
-
-      // ---- 召回：关键词匹配 + 模型粗筛 ----
-      const matched = matchCandidatesByKeywords(candidates, first.keywords || [], topK)
-      const shortlist = mergeCandidates(first.picked, matched).slice(0, topK)
-
-      if (shortlist.length === 0) {
-        const result: SelectionResult = {
-          picked: [], needUserImage: false, askMessage: '', reason: '', ok: false,
-          error: error || '检索阶段未召回任何候选图片'
-        }
-        return result
-      }
-
-      logInfo(`两级检索召回 ${shortlist.length}/${candidates.length} 张进入精排`)
-
-      // ---- 第二级：精排 ----
-      const final = await runSingleStageSelection(shortlist, userInput, cmdConfig, promptText, max)
-      final.recalled = shortlist.length
-      final.total = candidates.length
-      return final
-    }
-
-    /** 单阶段：把候选一次性交给模型挑选 */
-    async function runSingleStageSelection(
-      candidates: CandidateImage[],
-      userInput: string,
-      cmdConfig: CommandConfig['nested']['commands'][number],
-      promptText: string,
-      max: number
-    ): Promise<SelectionResult> {
-      const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
-      const content = (selector.prompt || DEFAULT_SELECTOR_PROMPT)
-        .replace(/\{candidates\}/g, buildIndexText(candidates))
-        .replace(/\{userInput\}/g, userInput || '（用户未附加说明）')
-        .replace(/\{max\}/g, String(max))
-        .replace(/\{command\}/g, cmdConfig.name || '')
-        .replace(/\{prompt\}/g, promptText || '')
-
-      // 支持识别图片时，把候选图片本身一起发给模型（编号文字 + 图片交替）
-      // 图片先自己下载转 base64：上游拉不到原链接会整条请求 400
-      const visionOn = selector.vision === true
-      const inlined = visionOn
-        ? await inlineCandidateImages(candidates, selector.visionMaxImages || 6)
-        : undefined
-      const userContent = buildSelectorContent(content, candidates, visionOn, selector.visionMaxImages || 6, inlined)
-
-      const { raw, error } = await callSelectorModel(
-        userContent, content, visionOn, selector.selectMaxTokens || 8000
-      )
-
-      logInfo(`AI 选图原始响应: ${raw}`)
-      const result = parseSelection(raw, candidates, max)
-      if (!result.ok) result.error = error || '模型未返回可解析的选择结果'
-      return result
-    }
-
-    /** 发起一次选图请求；识图失败时自动退回纯文字再试一次 */
     async function callSelectorModel(
       content: string | any[],
-      plainText: string,
-      visionOn: boolean,
       maxTokens: number,
       systemPrompt?: string,
       temperature?: number
     ): Promise<{ raw: string | null, error: string }> {
       const selector: AISelectorConfig = config.aiSelector || ({} as AISelectorConfig)
-      const sysText = systemPrompt || '你是一个精准的参考图片选择助手，只输出 JSON。'
+      const sysText = systemPrompt || '你是一个精准的助手，只输出要求的内容。'
       const requestBody = {
         model: selector.model || 'Qwen/Qwen2.5-7B-Instruct',
         messages: [
@@ -3544,27 +3133,8 @@ export function apply(ctx: Context, config: CommandConfig) {
       const apiKey = selector.apiKey || config.apiKey
       const timeout = (selector.timeout || 60) * 1000
 
-      logInfo(`AI 选图请求: ${url} 模型 ${requestBody.model} 识别图片=${visionOn}`)
-      let { raw, error } = await requestSelectorModel(url, apiKey, requestBody, timeout)
-
-      // 带图片请求失败（模型不支持/图片取不到）时，退回纯文字再试一次
-      if (!raw && visionOn && selector.visionFallback !== false) {
-        ctx.logger.warn(
-          `AI 选图带图片请求失败（${error || '未知原因'}），退回纯文字描述再试一次。` +
-          `若该模型不支持图片输入（DeepSeek 等纯文本模型会返回 400），请关闭「选图模型支持识别图片」`
-        )
-        const retry = await requestSelectorModel(url, apiKey, {
-          ...requestBody,
-          messages: [
-            { role: 'system', content: sysText },
-            { role: 'user', content: plainText }
-          ]
-        }, timeout)
-        raw = retry.raw
-        error = retry.error
-      }
-
-      return { raw, error }
+      logInfo(`对话模型请求: ${url} 模型 ${requestBody.model}`)
+      return requestSelectorModel(url, apiKey, requestBody, timeout)
     }
 
     /** 请求对话模型接口（带退避重试），返回纯文本回复与失败原因 */
@@ -3654,51 +3224,6 @@ export function apply(ctx: Context, config: CommandConfig) {
       }
 
       return { raw: null, error: lastError }
-    }
-
-
-    /** 解析模型返回的 JSON 选择结果 */
-    function parseSelection(raw: string | null, candidates: CandidateImage[], max: number): SelectionResult {
-      return parseSelectionResult(raw, candidates, max, (msg: string) => ctx.logger.warn(msg))
-    }
-
-    /** 询问用户补充发送参考图片，返回用户输入内容（可能是图片或文字） */
-    async function askUserForImage(session: Session, quote: any, askText: string, timeoutSec: number): Promise<string | undefined> {
-      const [msgId] = await reply(session, [
-        session.text('image-prompt.messages.askimage', [askText, timeoutSec])
-      ])
-      try {
-        return await session.prompt(timeoutSec * 1000)
-      } finally {
-        try {
-          await session.bot.deleteMessage(session.channelId, msgId)
-        } catch {
-          ctx.logger.warn(`在频道 ${session.channelId} 尝试撤回消息ID ${msgId} 失败。`)
-        }
-      }
-    }
-
-    /**
-     * 等用户确认开画。
-     * 复用「等你发图」那套 session.prompt：拿到用户在这个频道的下一条消息再判断。
-     * 超时、或者回了别的话，都算取消（宁可让用户重发指令，也不要画错一张）。
-     */
-    async function waitForConfirm(session: Session, timeoutSec: number): Promise<boolean> {
-      let answer: string | undefined
-      try {
-        answer = await session.prompt((timeoutSec > 0 ? timeoutSec : 600) * 1000)
-      } catch (error) {
-        ctx.logger.warn(`等待确认时出错: ${error}`)
-        return false
-      }
-      if (answer === undefined || answer === null) {
-        logInfo(`等待确认超时（${timeoutSec} 秒未回复）`)
-        return false
-      }
-      const text = extractTextFromMessage(answer)
-      const ok = isConfirmInput(text)
-      logInfo(`开画前确认：用户回复 ${JSON.stringify(text)} -> ${ok ? '开始画' : '视为取消'}`)
-      return ok
     }
 
     /** 从消息中提取纯文本 */
