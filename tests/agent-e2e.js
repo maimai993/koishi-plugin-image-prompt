@@ -48,10 +48,21 @@ const LOGGER_STUB = {
 }
 
 /** 一个请求体里带了几张参考图 */
-const imageCount = (call) => {
+const imageCount = (call) => imageUrls(call).length
+
+/**
+ * 请求体里参考图的地址。
+ * 图会被下载成 base64 data url 塞进请求体，所以要把 base64 解回原文 ——
+ * 探针的假 http.file 返回的就是「url 本身」，解码后正好能看出这张图是谁。
+ */
+const imageUrls = (call) => {
   const content = call && call.body && call.body.messages && call.body.messages[0] && call.body.messages[0].content
-  if (!Array.isArray(content)) return 0
-  return content.filter(item => item && item.type === 'image_url').length
+  if (!Array.isArray(content)) return []
+  return content.filter(item => item && item.type === 'image_url').map(item => {
+    const raw = String(item.image_url?.url || '')
+    const m = /^data:[^;,]*;base64,(.+)$/s.exec(raw)
+    return m ? Buffer.from(m[1], 'base64').toString('utf8') : raw
+  })
 }
 
 /** 把脚本里的一步包成 assistant 消息 */
@@ -115,7 +126,8 @@ async function run(scripts, options = {}) {
       return { choices: [{ message: { role: 'assistant', content: '![result](https://img/result.png)' } }] }
     },
     get: async () => ({}),
-    file: async () => ({ data: Buffer.alloc(32) }),
+    // 返回 url 本身当内容：图会被转成 base64 塞进请求体，解码后正好能看出这张图是谁
+    file: async (src) => ({ data: Buffer.from(String(src)) }),
   })
 
   const plugin = require('../lib/index.js')
@@ -164,6 +176,7 @@ async function run(scripts, options = {}) {
     },
     resultGallery: { enabled: false },
     backgroundDrawing: { enabled: false },
+    avatar: { enabled: true, autoAt: true, autoSelf: false, size: 640, ...options.avatar },
     ...(options.top || {}),
     nested: {
       commands: [
@@ -201,6 +214,16 @@ async function run(scripts, options = {}) {
   const results = []
   for (const userText of userTexts) {
     const fullMessage = `/画图/测试${userText ? ' ' + userText : ''}`
+
+    // 用户随消息发的图 / @ 的人：拼进原始 content。
+    // 注意 stripped.content 要模拟 Koishi 的行为 —— 它会把开头连续的 <at> 剥掉，
+    // 所以「/画图/测试 @某某」里 @ 只出现在 content 里，stripped 里没有。
+    const parts = []
+    for (const t of options.atTargets || []) parts.push(h.at(String(t.id), t.name ? { name: t.name } : {}))
+    for (const u of options.images || []) parts.push(h.image(u))
+    parts.push(h.text(fullMessage))
+    const hasExtras = !!(options.atTargets || options.images)
+
     const session = {
       selfId: 'bot-1',
       userId: 'user-1',
@@ -208,15 +231,18 @@ async function run(scripts, options = {}) {
       channelId: 'channel-1',
       guildId: undefined,
       messageId: 'msg-1',
-      content: fullMessage,
-      event: { message: { content: [h.text(fullMessage)] } },
-      stripped: { content: [h.text(fullMessage)] },
+      content: hasExtras ? parts.join('') : fullMessage,
+      event: { message: { content: parts } },
+      stripped: { content: hasExtras ? parts.filter(p => p.type !== 'at') : [h.text(fullMessage)] },
+      ...(options.authorAvatar ? { author: { avatar: options.authorAvatar } } : {}),
       app: { koishi: { config: {} } },
       text: (key, params) => key + (params ? ' :: ' + params.join(' | ') : ''),
       send: async (content) => { sent.push(content); return ['mid-1'] },
       bot: {
         sendMessage: async (_channelId, content) => { sent.push(['[主动]', content]); return ['mid-1'] },
         deleteMessage: async () => {},
+        // QQ 官方机器人的 appid，头像地址要用它拼
+        ...(options.botConfigId ? { config: { id: options.botConfigId } } : {}),
       },
       prompt: async () => answers.shift(),
     }
@@ -265,10 +291,10 @@ async function main() {
     check('★ 一共 4 次 agent 请求（搜图 / 提问 / 开画 / 收尾）', () =>
       assert.strictEqual(r.agentCalls.length, 4, `实际 ${r.agentCalls.length} 次`))
 
-    check('★ 第一次请求带上了 3 个工具定义', () => {
+    check('★ 第一次请求带上了 4 个工具定义', () => {
       const tools = r.agentCalls[0].body.tools
       assert.ok(Array.isArray(tools), '应该带 tools')
-      assert.deepStrictEqual(tools.map(t => t.function.name), ['gallery_search', 'ask_user', 'draw'])
+      assert.deepStrictEqual(tools.map(t => t.function.name), ['gallery_search', 'ask_user', 'get_avatar', 'draw'])
     })
 
     check('★ 系统提示词里写了「先搜图库 + 开画前确认」', () => {
@@ -349,7 +375,7 @@ async function main() {
       { content: '{"tool":"gallery_search","args":{"keyword":"白发"}}' },
       { content: '{"tool":"draw","args":{"prompt":"a white-hair girl","references":["ref1"]}}' },
       '画好了',
-    ]], { rejectTools: true })
+    ]], { rejectTools: true, agent: { askBeforePolish: false } })
 
     if (process.env.DEBUG_E2E) {
       console.log('    [debug] agent 请求:', r.agentCalls.length, ' 绘图:', r.drawCalls.length)
@@ -376,18 +402,75 @@ async function main() {
   console.log('5) 模型编造 id -> 不塞不存在的参考图')
   {
     const r = await run([[
-      { toolCalls: [{ name: 'draw', args: { prompt: 'a cat', references: ['ref99'] } }] },
+      // 带一张真实存在的（ref1）让流程真的走到绘图，同时混一个编造的 ref99
+      { toolCalls: [{ name: 'draw', args: { prompt: 'a cat', references: ['ref1', 'ref99'] } }] },
       '好了',
-    ]])
+    ]], { agent: { askBeforePolish: false } })
 
-    check('★ 编造的编号被丢掉，绘图不带任何参考图', () => {
+    check('★ 编造的编号被丢掉，只用真实存在的那张', () => {
       assert.strictEqual(r.drawCalls.length, 1)
-      assert.strictEqual(imageCount(r.drawCalls[0]), 0, '不应硬塞一张图')
+      assert.strictEqual(imageCount(r.drawCalls[0]), 1, '只应带 ref1 一张，不该硬塞不存在的图')
     })
     check('工具结果里告诉模型这个 id 不存在', () => {
-      const toolMsgs = r.agentCalls[1].body.messages.filter(m => m.role === 'tool')
-      const payload = JSON.parse(toolMsgs[0].content)
+      const toolMsgs = r.agentCalls[r.agentCalls.length - 1].body.messages.filter(m => m.role === 'tool')
+      const payload = JSON.parse(toolMsgs[toolMsgs.length - 1].content)
       assert.deepStrictEqual(payload.unknown, ['ref99'])
+    })
+  }
+
+  console.log('5b) 一个参考图都没有、模型也没问过 -> 插件兜底先问一句')
+  {
+    const r = await run([[
+      { toolCalls: [{ name: 'draw', args: { prompt: '一只猫' } }] },
+      { toolCalls: [{ name: 'draw', args: { prompt: '一只猫' } }] },
+      '画好了',
+    ]], { answers: ['直接画'] })
+
+    check('★ 第一次 draw 没有真的开画，而是先问了用户', () => {
+      assert.strictEqual(r.drawCalls.length, 1, '只应在第二次 draw 时真的画')
+      assert.ok(allTextOf(r).includes('image-prompt.messages.askreference'), `应先问要不要参考图，实际: ${allTextOf(r).slice(0, 300)}`)
+    })
+    check('★ 用户回「直接画」后重新 draw 就真的画了，且不再追问', () => {
+      const times = allTextOf(r).split('image-prompt.messages.askreference').length - 1
+      assert.strictEqual(times, 1, `兜底提问只应出现 1 次，实际 ${times} 次`)
+    })
+    check('★ 默认不润色：工具结果里明确告诉模型 polish=false', () => {
+      const toolMsgs = r.agentCalls[1].body.messages.filter(m => m.role === 'tool')
+      const payload = JSON.parse(toolMsgs[toolMsgs.length - 1].content)
+      assert.strictEqual(payload.asked, true)
+      assert.strictEqual(payload.polish, false, '用户说「直接画」，不该润色')
+    })
+  }
+
+  console.log('5c) 用户说「润色」-> 工具结果里 polish=true')
+  {
+    const r = await run([[
+      { toolCalls: [{ name: 'draw', args: { prompt: '一只猫' } }] },
+      { toolCalls: [{ name: 'draw', args: { prompt: '一只可爱的猫，柔和光线' } }] },
+      '画好了',
+    ]], { answers: ['帮我润色一下'] })
+
+    check('★ polish=true 回给模型', () => {
+      const toolMsgs = r.agentCalls[1].body.messages.filter(m => m.role === 'tool')
+      const payload = JSON.parse(toolMsgs[toolMsgs.length - 1].content)
+      assert.strictEqual(payload.polish, true, '用户说要润色，应回 true')
+    })
+  }
+
+  console.log('5d) 有参考图时只问「要不要润色」，不再问参考图')
+  {
+    const r = await run([[
+      { toolCalls: [{ name: 'draw', args: { prompt: '一只猫', references: ['ref1'] } }] },
+      { toolCalls: [{ name: 'draw', args: { prompt: '一只猫', references: ['ref1'] } }] },
+      '好了',
+    ]], { answers: ['直接画'] })
+
+    check('★ 问的是润色，不是参考图', () => {
+      assert.ok(allTextOf(r).includes('image-prompt.messages.askpolish'), '应问要不要润色')
+      assert.ok(!allTextOf(r).includes('image-prompt.messages.askreference'), '已经有参考图了，不该再问要不要参考图')
+    })
+    check('★ 参考图正常带上了', () => {
+      assert.strictEqual(imageCount(r.drawCalls[0]), 1)
     })
   }
 
@@ -428,9 +511,9 @@ async function main() {
   console.log('8) 后台绘图：提示词仍然只发一次')
   {
     const r = await run([[
-      { toolCalls: [{ name: 'draw', args: { prompt: 'bg style test' } }] },
+      { toolCalls: [{ name: 'draw', args: { prompt: 'bg style test', references: ['ref1'] } }] },
       '开始画了',
-    ]], { top: { backgroundDrawing: { enabled: true } } })
+    ]], { top: { backgroundDrawing: { enabled: true } }, agent: { askBeforePolish: false } })
 
     check('★ 提示词只出现 1 次', () => {
       const times = allTextOf(r).split('bg style test').length - 1
@@ -438,6 +521,78 @@ async function main() {
     })
     check('后台绘图提示仍在', () => {
       assert.ok(allTextOf(r).includes('image-prompt.messages.bgstart'), '应提示已开始后台绘图')
+    })
+  }
+
+  console.log('9) 用户首次输入就带图 -> 直接进参考图（不用模型记得填）')
+  {
+    const r = await run([[
+      { toolCalls: [{ name: 'draw', args: { prompt: '把这张图手办化' } }] },
+      '好了',
+    ]], {
+      images: ['https://img/user-shot.png'],
+      agent: { askBeforePolish: false },
+    })
+
+    check('★ 用户发的图自动带进绘图请求', () => {
+      assert.strictEqual(r.drawCalls.length, 1, `应发起 1 次绘图，实际 ${r.drawCalls.length}`)
+      assert.strictEqual(imageCount(r.drawCalls[0]), 1, '应带上用户那张图')
+      assert.ok(imageUrls(r.drawCalls[0]).some(u => u.includes('user-shot')), `应带用户图，实际: ${imageUrls(r.drawCalls[0])}`)
+    })
+    check('★ 系统提示词里列出了这张图的编号', () => {
+      const sys = r.agentCalls[0].body.messages[0].content
+      assert.ok(/用户随消息发的图：ref\d+（已自动带上/.test(sys), `应写明编号，实际: ${JSON.stringify(sys.slice(-300))}`)
+    })
+  }
+
+  console.log('10) @ 了谁 -> 自动用那个人的头像当参考图')
+  {
+    const r = await run([[
+      { toolCalls: [{ name: 'draw', args: { prompt: '画我和他的合照' } }] },
+      '好了',
+    ]], {
+      atTargets: [{ id: 'user-2', name: '小明' }],
+      botConfigId: '1020test',
+      agent: { askBeforePolish: false },
+    })
+
+    check('★ 被 @ 的人的头像自动带进绘图请求', () => {
+      assert.strictEqual(r.drawCalls.length, 1, `应发起 1 次绘图，实际 ${r.drawCalls.length}`)
+      const urls = imageUrls(r.drawCalls[0])
+      assert.ok(urls.some(u => u.includes('q.qlogo.cn/qqapp/1020test/user-2')), `应带小明头像，实际: ${urls}`)
+    })
+    check('★ 系统提示词里写清了这是谁的头像', () => {
+      const sys = r.agentCalls[0].body.messages[0].content
+      assert.ok(/被 @ 的人的头像（已自动带上/.test(sys), '应列出头像编号')
+      assert.ok(/小明/.test(sys), '应写清是谁的头像')
+    })
+    check('★ 自己没被 @，就不会自动带上自己的头像', () => {
+      const urls = imageUrls(r.drawCalls[0])
+      assert.ok(!urls.some(u => u.includes('user-1')), `不该带自己头像，实际: ${urls}`)
+    })
+  }
+
+  console.log('11) get_avatar 取自己的头像')
+  {
+    const r = await run([[
+      { toolCalls: [{ name: 'get_avatar', args: {} }] },
+      { toolCalls: [{ name: 'draw', args: { prompt: '画我', references: ['ref4'] } }] },
+      '好了',
+    ]], {
+      botConfigId: '1020test',
+      authorAvatar: 'https://img/self-avatar.png',
+      agent: { askBeforePolish: false },
+    })
+
+    check('★ get_avatar 返回了发指令者自己的头像编号', () => {
+      const toolMsgs = r.agentCalls[1].body.messages.filter(m => m.role === 'tool')
+      const payload = JSON.parse(toolMsgs[toolMsgs.length - 1].content)
+      assert.strictEqual(payload.ok, true, `应取到头像，实际: ${JSON.stringify(payload)}`)
+      assert.strictEqual(payload.id, 'ref4', '图库 3 张之后，自己的头像应是 ref4')
+    })
+    check('★ 这个编号真的能用在 draw 上', () => {
+      const urls = imageUrls(r.drawCalls[0])
+      assert.ok(urls.some(u => u.includes('self-avatar')), `应带上自己头像，实际: ${urls}`)
     })
   }
 

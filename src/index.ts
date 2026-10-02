@@ -212,7 +212,7 @@ export function resolveReferences(
 }
 
 /** agent 可用的工具名（JSON 兜底协议只对这几个名字生效，避免把正常回复当工具调用） */
-export const AGENT_TOOL_NAMES = ['gallery_search', 'ask_user', 'draw']
+export const AGENT_TOOL_NAMES = ['gallery_search', 'ask_user', 'get_avatar', 'draw']
 
 /** OpenAI function-calling 格式的工具定义 */
 export function buildAgentTools(): any[] {
@@ -249,13 +249,27 @@ export function buildAgentTools(): any[] {
     {
       type: 'function',
       function: {
+        name: 'get_avatar',
+        description: '取某个人的头像当参考图，返回它的编号。userId 留空 = 取发指令的人自己的头像；也可以填「被 @ 的人」列表里的 id。用户说「画我」「用我的头像」「画 @某某」时用它。',
+        parameters: {
+          type: 'object',
+          properties: {
+            userId: { type: 'string', description: '要取头像的用户 id（取自上下文里的「被 @ 的人」），留空或写 me/self 表示发指令的人自己' },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
         name: 'draw',
         description: '开始绘图。把最终提示词与要参考的图片编号交进来，画好会自动发到群里。涉及角色时记得把 gallery_search 找到的 id 写进 references。',
         parameters: {
           type: 'object',
           properties: {
-            // 提示词要短：宁可朴素，也不要堆术语写成几百字的「专业」prompt
-            prompt: { type: 'string', description: '绘图提示词。说人话、写简短就行，中文即可（绘图模型听得懂中文）；不要把用户的话扩写成几百字，也不要堆砌风格/材质/光线术语。画面上必须出现的文字要原样写进去' },
+            // 提示词要短；用户没说要润色就原封不动用他的原话
+            prompt: { type: 'string', description: '绘图提示词。**默认原封不动用用户的话**：简短、说人话，不要扩写成几百字，不要补画风/光线/材质术语，不要翻成英文；只有用户说过「帮我润色 / 优化一下」才加工。中文即可（绘图模型听得懂中文）。画面上必须出现的文字要原样写进去' },
             references: {
               type: 'array',
               items: { type: 'string' },
@@ -367,6 +381,78 @@ export function cleanAskMessage(raw: any, max = 200): string {
 
   if (text.length > max) text = text.slice(0, max) + '…'
   return text
+}
+
+/**
+ * 从用户的回答里判断他要不要润色提示词。
+ * 默认 false —— 用户的原话原封不动交给绘图模型才是对的默认值。
+ */
+export function parsePolishIntent(text: string): boolean {
+  const t = String(text || '')
+  if (!t) return false
+  if (/不(用|要|必)?(润色|优化|加工|改)|别(润色|优化|加工)|原样|原封不动|直接画|不用了/.test(t)) return false
+  return /润色|优化一下|加工|丰富|扩写|细化|详细[一点些]|写(得)?(更)?(完整|详细)|帮我(写|改)/.test(t)
+}
+
+/** 从消息内容里解析 @ 到的人。type="all"（@全体成员）和 @机器人自己 会被跳过 */
+export function extractAtIds(content: string, selfId?: string): { id: string, name: string }[] {
+  if (!content) return []
+  const out: { id: string, name: string }[] = []
+  const seen = new Set<string>()
+  for (const el of h.select(content, 'at')) {
+    const id = String(el.attrs.id ?? el.attrs.user ?? '').trim()
+    if (!id || id === selfId) continue
+    if (String(el.attrs.type || '') === 'all') continue
+    if (seen.has(id)) continue
+    seen.add(id)
+    out.push({ id, name: String(el.attrs.name || el.attrs.nick || '').trim() })
+  }
+  return out
+}
+
+/**
+ * 拼头像地址。优先级：自定义模板 > 适配器直接给的 > 平台内置规则。
+ * 拼不出来返回空字符串（调用方再决定是问适配器还是放弃）。
+ */
+export function buildAvatarUrl(input: {
+  userId: string
+  platform?: string
+  selfId?: string
+  appId?: string
+  /** 发送者自己的头像（适配器已经在消息里带过来了） */
+  authorAvatar?: string
+  template?: string
+  size?: number
+}): string {
+  const userId = String(input?.userId || '').trim()
+  if (!userId) return ''
+
+  const size = Number(input.size) > 0 ? Number(input.size) : 640
+  const platform = String(input.platform || '')
+  const appId = String(input.appId || '')
+
+  if (input.template) {
+    return String(input.template).replace(/\{(\w+)\}/g, (_m, key) => {
+      const vars: Record<string, string> = {
+        userId, platform, size: String(size),
+        selfId: String(input.selfId || ''),
+        appId,
+      }
+      return vars[key] ?? ''
+    })
+  }
+
+  if (input.authorAvatar) return String(input.authorAvatar)
+
+  // QQ 官方机器人：https://q.qlogo.cn/qqapp/{appid}/{openid}/{size}
+  if (appId && (platform === 'qq' || platform === 'qqguild')) {
+    return `https://q.qlogo.cn/qqapp/${appId}/${userId}/${size}`
+  }
+  // 拿得到真 QQ 号时走通用头像服务（onebot / red 等）
+  if (/^(qq|onebot|red|qqguild)$/.test(platform) && /^\d{5,12}$/.test(userId)) {
+    return `https://q1.qlogo.cn/g?b=qq&nk=${userId}&s=${size}`
+  }
+  return ''
 }
 
 /**
@@ -880,6 +966,7 @@ interface CommandConfig {
   referenceGroups?: ReferenceGroup[]
   aiSelector?: AISelectorConfig
   agent?: AgentConfig
+  avatar?: AvatarConfig
   showPrompt?: boolean
   promptMaxLength?: number
   appendUserInput?: boolean
@@ -999,6 +1086,24 @@ interface AgentConfig {
   historyTurns: number
   /** 把每一轮的工具调用打到日志里，方便排查 */
   debugLog: boolean
+  /** 用户没给任何参考图时，开画前先问一句「要不要参考图」 */
+  askIfNoReference: boolean
+  /** 开画前先问一句「要不要润色提示词」（默认不润色，原话直出） */
+  askBeforePolish: boolean
+}
+
+/** 头像参考图配置 */
+interface AvatarConfig {
+  /** 总开关：能不能拿用户头像当参考图 */
+  enabled: boolean
+  /** 用户 @ 了谁，就自动把那个人的头像作为参考图（@ 本身就是明确指定） */
+  autoAt: boolean
+  /** 用户没发图也没 @ 人时，自动拿他自己的头像当参考图 */
+  autoSelf: boolean
+  /** 头像尺寸（边长像素） */
+  size: number
+  /** 自定义头像地址模板，留空用内置规则。占位符：{userId} {platform} {selfId} {appId} {size} */
+  urlTemplate: string
 }
 
 /** agent 参考图登记表里的一条 */
@@ -1007,7 +1112,7 @@ export interface RefEntry {
   url: string
   description: string
   group: string
-  source: 'gallery' | 'user' | 'cmd'
+  source: 'gallery' | 'user' | 'cmd' | 'avatar'
 }
 
 /** 交给 AI 挑选的候选图片 */
@@ -1056,6 +1161,7 @@ const DEFAULT_AGENT_INSTRUCTIONS = `你是 QQ 群里的绘图助手。用户发�
 - gallery_search：按关键词搜索参考图库。**涉及具体角色/立绘时必须先搜一次**。
   多个关键词用空格分隔（如「白发 立绘」），全部命中的排在最前；搜不到就换个词再搜。
 - ask_user：把问题发给用户**并等他回复**（他发的图也会一起带回来）。
+- get_avatar：取某个人的头像当参考图。userId 留空取发指令者自己；也可以取被 @ 的人的头像。
 - draw：真正开始画。把 prompt 和挑中的参考图编号交进去，画好会自动发到群里。
 
 工作规则：
@@ -1070,22 +1176,35 @@ const DEFAULT_AGENT_INSTRUCTIONS = `你是 QQ 群里的绘图助手。用户发�
 4. 画面上要出现文字（台词、标题、招牌、字幕）时，把文字原样写进 prompt，并说明「这些字必须原样出现，不能变形或自创字形」。
 5. draw 返回 ok=false 时，看 error 决定：能改的（提示词问题）就换个写法重试，改不了的（限流/配额）就如实告诉用户。
 6. 流程结束后用中文回一句简短的结果说明（不要复述 prompt，不要写小作文，不要再问「还要我做什么」）。
-7. 图片编号：gallery_search 结果里的 id、用户发的图（user1、user2…）、指令默认图（cmd1…）都可以直接写进 draw 的 references。
-   只填你确认存在的编号，**绝对不要编造 id**。
-8. 【prompt 要短，要说人话】**不要**把用户的话扩写成几百字的「专业」提示词：
+7. 图片编号：gallery_search 结果里的 id、用户随消息发的图、头像、指令默认图都可以直接写进 draw 的 references。
+   只填上下文里**明确列出过**的编号，**绝对不要编造 id**。
+   - 用户随消息发的图会自动带上，不用你再填；
+   - 他 @ 了谁，那个人的头像也会自动带上。
+8. 【没指定参考图时先问一句】用户这次没发图、没 @ 人、指令本身也没有默认参考图，你也搜不到合适的立绘时，
+   **不要直接 draw**。先用 ask_user 问一句要不要参考图，并给出选项（例如「用你自己的头像 / 用 @某某 的头像 /
+   我帮你从图库找一张 / 不用参考直接画」）。用户说「不用 / 随便 / 直接画」就立刻开画，**不要问第二次**。
+9. 【要画「我」就用头像】用户说「画我」「用我的形象」「画我和 xxx」却没给图时，用 get_avatar 取他自己的头像；
+   说「画 @某某」时取那个人的头像（一般已经自动带上了，直接用那个编号即可）。
+10. 【默认不润色，用户点头才润色】把用户的话**原封不动**交给绘图模型就是最好的默认值：
+   - **不要**主动扩写、不要补画风/光线/材质/镜头、不要翻成英文、不要加「masterpiece」这类词；
+   - 用户明确说「帮我润色 / 优化一下 / 写详细点」时，你才把提示词写得更完整；
+   - draw 工具返回 asked=true 时看它给的 polish 字段：polish=true 才润色，false 或没给就**一个字都别改**；
    - 用户用中文提的需求，prompt 就写中文（绘图模型听得懂中文，理解力也够用）；
-   - 别为了显得专业就去堆风格 / 材质 / 光线 / 镜头术语，更别刻意翻成英文；
    - 只保留用户真正说过的内容 + 画面必须有的要素，**不要替他脑补细节**；
    - 提示词越长，各要素互相稀释，出图反而越走样。一两句话能把画面说清就够了。
 
 如果你所在的接口不支持函数调用，就**只输出一行 JSON** 来调用工具，例如：
 {"tool":"gallery_search","args":{"keyword":"白发 立绘"}}
 {"tool":"ask_user","args":{"question":"想要什么画风？"}}
+{"tool":"get_avatar","args":{"userId":""}}
 {"tool":"draw","args":{"prompt":"...","references":["ref1","user1"]}}
 不想调用工具时，正常输出给用户看的中文即可。`
 
 /** 「开画前先问一句」的两种提示词分支 */
-const AGENT_CONFIRM_RULE_ON = `**必须先 ask_user**：用一句话告诉用户「这次会参考哪几张图 + 大致画成什么样」，用户点头后才能调用 draw。
+const AGENT_CONFIRM_RULE_ON = `**必须先 ask_user**：用一句话告诉用户「这次会参考哪几张图 + 大致画成什么样」，
+并顺带问一句「提示词要不要我帮你润色（默认直接用你的原话）」，用户点头后才能调用 draw。
+- 用户说「润色 / 优化 / 丰富一下」→ 你再把提示词写得更完整；
+- 用户说「直接画 / 不用 / 原样」或没提这件事 → **原封不动用他的原话**，一个字都别润色。
 用户回复了否定或提出修改意见，就按他说的改，再确认一次或直接画（他说「直接画」就不用再问）。`
 const AGENT_CONFIRM_RULE_OFF = `用户需求已经明确的，直接调用 draw，不用多问一句。只有真的缺关键信息才 ask_user。`
 
@@ -1093,6 +1212,7 @@ const AGENT_CONFIRM_RULE_OFF = `用户需求已经明确的，直接调用 draw�
 const AGENT_JSON_FALLBACK_RULE = `（注意：当前接口不支持函数调用）请你**只用一行 JSON** 来调用工具，不要输出别的内容：
 {"tool":"gallery_search","args":{"keyword":"白发 立绘"}}
 {"tool":"ask_user","args":{"question":"想要什么画风？"}}
+{"tool":"get_avatar","args":{"userId":""}}
 {"tool":"draw","args":{"prompt":"...","references":["ref1","ref2"]}}
 不需要调用工具时，正常输出给用户看的中文即可。`
 
@@ -1648,8 +1768,20 @@ export const Config: Schema = Schema.intersect([
       baseUrl: Schema.string().role('link').description('agent 专用接口地址（留空则复用「AI 模型接口」的地址）'),
       apiKey: Schema.string().role('secret').description('agent 专用密钥（留空则复用「AI 模型接口」的密钥）'),
       instructions: Schema.string().role('textarea', { rows: [16, 8] }).default(DEFAULT_AGENT_INSTRUCTIONS).description('驱动 agent 行为的系统提示词（只写「有哪些工具 + 什么时候用」，别写死流程）。可用占位符：{confirmRule} 开画确认规则、{command} 指令名、{prompt} 指令提示词、{userInput} 用户附加需求、{imageCount} 用户随消息发的图数量、{refCount} 可检索的参考图数量。指令名/提示词等上下文会自动附在提示词末尾，不用自己引用'),
+      askIfNoReference: Schema.boolean().default(true).description('用户这次既没发图、也没 @ 人、指令本身也没有默认参考图时，开画前先问一句「要不要参考图」（可以用他自己的头像 / @ 别人的头像）。这条是插件兜底执行的，模型自己先问过就不再问'),
+      askBeforePolish: Schema.boolean().default(true).description('开画前先问用户「提示词要不要我帮你润色」。**默认是原封不动把用户的原话交给绘图模型**，只有用户说「润色 / 优化」才加工。这条同样是插件兜底，模型自己先问过就不再问'),
     }).collapse().description('Agent 配置（指令较长，已折叠）'),
   }).description('Agent 模式'),
+
+  Schema.object({
+    avatar: Schema.object({
+      enabled: Schema.boolean().default(true).description('开启头像参考图：可以把群友的头像当参考图来画'),
+      autoAt: Schema.boolean().default(true).description('用户 @ 了谁，就自动把那个人的头像作为参考图（@ 本身就是明确的指定）'),
+      autoSelf: Schema.boolean().default(false).description('用户没发图也没 @ 人时，自动拿他自己的头像当参考图。关掉也没关系，「用我的头像画」这类需求 agent 会自己调用 get_avatar'),
+      size: Schema.number().default(640).min(64).max(1024).step(64).description('头像边长（像素）'),
+      urlTemplate: Schema.string().default('').description('自定义头像地址模板，留空用内置规则。占位符：{userId} 用户 id、{platform} 平台、{selfId} 机器人 id、{appId} 机器人 appid、{size} 尺寸'),
+    }).description('头像参考图'),
+  }).description('头像参考图'),
 
   Schema.object({
     appendUserInput: Schema.boolean().default(true).description('把用户随指令发的附加需求并入绘图提示词（例如「手办化 xxx 在偷吃白饭被发现的表情」）'),
@@ -1890,6 +2022,8 @@ export function apply(ctx: Context, config: CommandConfig) {
           needimages: '请提供至少一张图片',
           agentfailed: '绘图助手这次没跑起来（{0}）。可以先关掉「Agent 模式」照常画图，或换一个支持工具调用的模型。',
           agentnoresult: '这次没能理出个结果来，麻烦再说一次你想画什么～',
+          askreference: '这次没有指定参考图。要参考图片吗？可以直接发图、@ 一个人用他的头像，或者说「用我的头像」；不需要就回「直接画」。\n另外，提示词要我帮你润色一下吗？默认直接用你的原话。',
+          askpolish: '这次直接按你的原话开画。要我先帮你润色一下提示词吗？回「润色」我加工一下，回「直接画」就原样交给绘图模型。',
           optimizefailed: '（提示词融合失败，已改为追加模式）',
           bgstart: '已开始后台绘图（{0} 张图），画好后会在这里通知你...',
           bgqueue: '（当前有 {0} 个任务在排队）',
@@ -2002,7 +2136,31 @@ export function apply(ctx: Context, config: CommandConfig) {
       const baseIds = (defaultImageUrls || []).filter(Boolean).map(url => register('cmd', url, '', '指令默认图'))
       const userIds = extractImagesFromSession(session).map(url => register('user', url, '', '用户发送'))
 
-      logInfo(`[${cmdConfig.name}] agent 启动：可搜索参考图 ${pool.length} 张，默认图 ${baseIds.length} 张，用户随消息发的图 ${userIds.length} 张`)
+      // ---- 头像参考图 ----
+      // 自己的头像登记进表（模型要画「我」时可以取用）；@ 到的人的头像直接作为参考图带上
+      const avatarCfg: AvatarConfig = config.avatar || ({} as AvatarConfig)
+      const avatarOn = avatarCfg.enabled !== false
+      const atTargets = avatarOn ? collectAtTargets(session) : []
+      let selfAvatarId = ''
+      const atAvatarIds: string[] = []
+      const atAvatarById = new Map<string, string>()
+      if (avatarOn) {
+        const selfUrl = await fetchAvatarUrl(session, session.userId)
+        if (selfUrl) {
+          selfAvatarId = register('avatar', selfUrl, '发指令的人的头像', '头像')
+        }
+        if (avatarCfg.autoAt !== false) {
+          for (const target of atTargets) {
+            const url = await fetchAvatarUrl(session, target.id)
+            if (!url) continue
+            const id = register('avatar', url, `${target.name || target.id} 的头像`, '头像')
+            if (!atAvatarIds.includes(id)) atAvatarIds.push(id)
+            atAvatarById.set(target.id, id)
+          }
+        }
+      }
+
+      logInfo(`[${cmdConfig.name}] agent 启动：可搜索参考图 ${pool.length} 张，默认图 ${baseIds.length} 张，用户随消息发的图 ${userIds.length} 张，头像 ${atAvatarIds.length + (selfAvatarId ? 1 : 0)} 张`)
 
       // ---- 历史（同一频道记住最近几轮，让「再画一张」能接上）----
       const historyKey = agentHistoryKey(session)
@@ -2012,7 +2170,9 @@ export function apply(ctx: Context, config: CommandConfig) {
       remember({ role: 'user', content: userInputText || '（用户没有附加说明）' })
 
       const messages: any[] = [
-        { role: 'system', content: buildAgentSystemPrompt(cmdConfig, userInputText, userIds.length, pool.length, baseIds, agentCfg) },
+        { role: 'system', content: buildAgentSystemPrompt(cmdConfig, userInputText, pool.length, {
+          userIds, baseIds, atAvatarIds, selfAvatarId, atTargets,
+        }, agentCfg) },
         ...history,
         { role: 'user', content: userInputText ? userInputText : '（用户没有附加说明，请按指令自带的提示词来）' },
       ]
@@ -2023,6 +2183,10 @@ export function apply(ctx: Context, config: CommandConfig) {
       let finalText = ''
       let drew = false
       let failed = ''
+      /** 这轮里模型自己有没有问过用户（问过就不再替它追问参考图的事） */
+      let askedOnce = false
+      /** 开画前的兜底确认已经问过了，一次流程只问一次 */
+      let drawAsked = false
 
       for (let iteration = 0; iteration < maxIterations; iteration++) {
         if (!isActive || !ctx.scope.isActive) break
@@ -2088,8 +2252,9 @@ export function apply(ctx: Context, config: CommandConfig) {
         switch (name) {
           case 'gallery_search': return toolGallerySearch(args)
           case 'ask_user': return toolAskUser(args)
+          case 'get_avatar': return toolGetAvatar(args)
           case 'draw': return toolDraw(args)
-          default: return JSON.stringify({ ok: false, error: `没有叫「${name}」的工具，可用的是 gallery_search / ask_user / draw` })
+          default: return JSON.stringify({ ok: false, error: `没有叫「${name}」的工具，可用的是 gallery_search / ask_user / get_avatar / draw` })
         }
       }
 
@@ -2114,10 +2279,35 @@ export function apply(ctx: Context, config: CommandConfig) {
         })
       }
 
+      /** 取某人头像：留空取发指令的人，也可以取被 @ 的人 */
+      async function toolGetAvatar(args: any): Promise<string> {
+        if (!avatarOn) return JSON.stringify({ ok: false, error: '头像参考图功能已关闭' })
+        const raw = String(args?.userId ?? args?.id ?? args?.user ?? '').trim()
+        if (!raw || /^(me|self|自己|我)$/i.test(raw) || raw === session.userId) {
+          if (selfAvatarId) {
+            return JSON.stringify({ ok: true, id: selfAvatarId, userId: session.userId, note: '发指令的人自己的头像' })
+          }
+          const url = await fetchAvatarUrl(session, session.userId)
+          if (!url) return JSON.stringify({ ok: false, error: '没取到他自己的头像（这个平台可能不提供头像地址）' })
+          selfAvatarId = register('avatar', url, '发指令的人的头像', '头像')
+          return JSON.stringify({ ok: true, id: selfAvatarId, userId: session.userId, note: '发指令的人自己的头像' })
+        }
+
+        const cached = atAvatarById.get(raw)
+        if (cached) return JSON.stringify({ ok: true, id: cached, userId: raw, note: '被 @ 的人的头像' })
+
+        const url = await fetchAvatarUrl(session, raw)
+        if (!url) return JSON.stringify({ ok: false, error: `没取到 ${raw} 的头像` })
+        const id = register('avatar', url, `${raw} 的头像`, '头像')
+        atAvatarById.set(raw, id)
+        return JSON.stringify({ ok: true, id, userId: raw, note: '这个人的头像' })
+      }
+
       /** 提问并等用户的下一条消息（图也会一起带回来） */
       async function toolAskUser(args: any): Promise<string> {
         const question = cleanAskMessage(args?.question ?? args?.text ?? args?.message)
         if (!question) return JSON.stringify({ ok: false, error: 'question 不能为空' })
+        askedOnce = true
 
         try {
           await sendNotice(session, question)
@@ -2146,10 +2336,34 @@ export function apply(ctx: Context, config: CommandConfig) {
         remember({ role: 'user', content: text || (ids.length ? `（用户发了 ${ids.length} 张图片）` : '（用户什么都没说）') })
         logInfo(`agent 提问「${question}」-> 用户回复: ${text || '（无文字）'}，图片 ${ids.length} 张`)
 
+        // 回复里 @ 了谁 / 说「用我的头像」→ 把对应头像也登记进来
+        const avatars: { id: string, note: string }[] = []
+        if (avatarOn) {
+          if (avatarCfg.autoAt !== false) {
+            for (const target of extractAtIds(String(answer || ''), session.selfId)) {
+              const cached = atAvatarById.get(target.id)
+              if (cached) {
+                if (!avatars.some(a => a.id === cached)) avatars.push({ id: cached, note: `${target.name || target.id} 的头像` })
+                continue
+              }
+              const url = await fetchAvatarUrl(session, target.id)
+              if (!url) continue
+              const id = register('avatar', url, `${target.name || target.id} 的头像`, '头像')
+              atAvatarById.set(target.id, id)
+              avatars.push({ id, note: `${target.name || target.id} 的头像` })
+            }
+          }
+          // 「用我的头像」「画我」——就算关闭了 autoSelf，用户明确开口了就给他
+          if (/头像|我的形象|画我|我自己/.test(text) && selfAvatarId) {
+            if (!avatars.some(a => a.id === selfAvatarId)) avatars.push({ id: selfAvatarId, note: '发指令的人自己的头像' })
+          }
+        }
+
         return JSON.stringify({
           ok: true,
           text,
           images: ids.map((id, i) => ({ id, note: `用户这次发的第 ${i + 1} 张图` })),
+          ...(avatars.length ? { avatars } : {}),
         })
       }
 
@@ -2168,9 +2382,40 @@ export function apply(ctx: Context, config: CommandConfig) {
         const wanted: string[] = []
         const pushId = (id: string) => { if (id && !wanted.includes(id)) wanted.push(id) }
         baseIds.forEach(pushId)
+        // 用户随消息发的图、他 @ 的人的头像：都是他明确指定的，直接进参考图，不依赖模型记得填
+        userIds.forEach(pushId)
+        atAvatarIds.forEach(pushId)
+        if (avatarOn && avatarCfg.autoSelf) pushId(selfAvatarId)
         ids.forEach(pushId)
         const capped = wanted.slice(0, maxSelect)
         const imageUrls = capped.map(id => registry.get(id)?.url).filter(Boolean) as string[]
+
+        // 开画前兜底确认：一次流程最多问一次；模型自己已经问过就不再打扰
+        // 两个话题合并进同一句话 —— 参考图要不要 + 提示词要不要润色
+        const needRef = !capped.length && agentCfg.askIfNoReference !== false
+        const needPolish = agentCfg.askBeforePolish !== false
+        if (!drawAsked && !askedOnce && (needRef || needPolish)) {
+          drawAsked = true
+          const asked = await toolAskUser({
+            question: needRef
+              ? session.text('image-prompt.messages.askreference')
+              : session.text('image-prompt.messages.askpolish'),
+          })
+          let parsed: any = {}
+          try { parsed = JSON.parse(asked) } catch { parsed = {} }
+          // 「不用润色 / 直接画 / 原样」→ false；明确说「润色 / 优化」→ true。默认不润色
+          const polish = parsed.ok ? parsePolishIntent(parsed.text) : false
+          return JSON.stringify({
+            ok: false,
+            asked: true,
+            polish,
+            ...(parsed.images?.length ? { newImages: parsed.images } : {}),
+            ...(parsed.avatars?.length ? { newAvatars: parsed.avatars } : {}),
+            note: polish
+              ? '已经替你问过用户了：他说要润色，可以把提示词写得更完整。他给了图/头像也要写进 references。重新调用 draw 开画，不要再问第二次'
+              : '已经替你问过用户了：提示词**原封不动用他的原话**，不要润色、不要扩写、不要翻译。他给了图/头像就写进 references。重新调用 draw 开画，不要再问第二次',
+          })
+        }
 
         const finalPrompt = args?.negative_prompt
           ? `${prompt}\n\nNegative prompt: ${String(args.negative_prompt).trim()}`
@@ -2202,16 +2447,21 @@ export function apply(ctx: Context, config: CommandConfig) {
     function buildAgentSystemPrompt(
       cmdConfig: CommandConfig['nested']['commands'][number],
       userInputText: string,
-      imageCount: number,
       refCount: number,
-      baseIds: string[],
+      refs: {
+        userIds: string[]
+        baseIds: string[]
+        atAvatarIds: string[]
+        selfAvatarId: string
+        atTargets: { id: string, name: string }[]
+      },
       agentCfg: AgentConfig
     ): string {
       const instructions = renderAgentInstructions(agentCfg.instructions || DEFAULT_AGENT_INSTRUCTIONS, {
         command: cmdConfig.name || '',
         prompt: cmdConfig.prompt || '',
         userInput: userInputText || '',
-        imageCount,
+        imageCount: refs.userIds.length,
         refCount,
         confirmRule: agentCfg.confirmBeforeDraw !== false ? AGENT_CONFIRM_RULE_ON : AGENT_CONFIRM_RULE_OFF,
       })
@@ -2220,10 +2470,17 @@ export function apply(ctx: Context, config: CommandConfig) {
         `- 绘图指令：${cmdConfig.name}`,
         `- 指令自带的提示词：${cmdConfig.prompt || '（空，这是自定义指令）'}`,
         `- 用户这次说的话：${userInputText || '（用户没说话）'}`,
-        `- 用户随消息发的图：${imageCount} 张${imageCount ? '（编号见下方，可以直接写进 draw 的 references）' : ''}`,
+        `- 用户随消息发的图：${refs.userIds.length ? `${refs.userIds.join('、')}（已自动带上，不用再填）` : '0 张'}`,
         `- 图库里可以搜到的参考图：${refCount} 张`,
       ]
-      if (baseIds.length) lines.push(`- 指令默认参考图（已自动带上，不用再填）：${baseIds.join('、')}`)
+      if (refs.baseIds.length) lines.push(`- 指令默认参考图（已自动带上，不用再填）：${refs.baseIds.join('、')}`)
+      if (refs.selfAvatarId) lines.push(`- 发指令的人自己的头像：${refs.selfAvatarId}（他想画「我」时用这个，或用 get_avatar 取）`)
+      if (refs.atAvatarIds.length) {
+        const who = refs.atTargets.map(t => `${t.name || t.id}`).join('、')
+        lines.push(`- 被 @ 的人的头像（已自动带上，不用再填）：${refs.atAvatarIds.join('、')}（分别是 ${who} 的头像）`)
+      } else if (refs.atTargets.length) {
+        lines.push(`- 用户 @ 了 ${refs.atTargets.map(t => t.name || t.id).join('、')}，但没取到他们的头像，需要的话用 get_avatar 再试`)
+      }
       if (cmdConfig.custom) lines.push('- 这是自定义指令：用户没说清楚要画什么时，先用 ask_user 问一句')
 
       return instructions + lines.join('\n')
@@ -2428,6 +2685,22 @@ export function apply(ctx: Context, config: CommandConfig) {
       }
 
       const images: string[] = [...(defaultImageUrls || []), ...extractImagesFromSession(session)]
+
+      // 头像参考图：@ 了谁就带上谁的头像；一张图都没有且开了 autoSelf 时带上自己的
+      const avatarCfg: AvatarConfig = config.avatar || ({} as AvatarConfig)
+      if (avatarCfg.enabled !== false) {
+        if (avatarCfg.autoAt !== false) {
+          for (const target of collectAtTargets(session)) {
+            const url = await fetchAvatarUrl(session, target.id)
+            if (url) images.push(url)
+          }
+        }
+        if (avatarCfg.autoSelf && !images.length) {
+          const url = await fetchAvatarUrl(session, session.userId)
+          if (url) images.push(url)
+        }
+      }
+
       const remaining = Math.max(0, maxImages - images.length)
       if (remaining > 0) {
         const [msgId] = await session.send(
@@ -2985,6 +3258,46 @@ export function apply(ctx: Context, config: CommandConfig) {
         .map(el => el.attrs.content || '')
         .join(' ')
         .trim()
+    }
+
+    /**
+     * 取这条消息里 @ 到的人。
+     * 注意不能只看 stripped.content —— Koishi 的 stripped 会把开头连续的 <at> 元素剥掉，
+     * 「/画图 @某某」这种写法里 @ 就丢了，必须看原始 content。
+     */
+    function collectAtTargets(session: Session): { id: string, name: string }[] {
+      const raw = String((session as any)?.content || session.stripped?.content || '')
+      return extractAtIds(raw, session.selfId)
+    }
+
+    /** 取某个人的头像地址：先按平台规则拼，拼不出来再去问适配器要 */
+    async function fetchAvatarUrl(session: Session, userId: string): Promise<string> {
+      if (!userId) return ''
+      const cfg: AvatarConfig = config.avatar || ({} as AvatarConfig)
+      const own = userId === session.userId
+
+      const url = buildAvatarUrl({
+        userId,
+        platform: session.platform,
+        selfId: session.selfId,
+        appId: (session as any)?.bot?.config?.id,
+        authorAvatar: own ? String((session as any)?.author?.avatar || '') : '',
+        template: cfg.urlTemplate,
+        size: Number(cfg.size) > 0 ? Number(cfg.size) : 640,
+      })
+      if (url) return url
+
+      // 内置规则拼不出来（Discord / KOOK / 频道类平台）时，让适配器直接给
+      try {
+        const member = session.guildId
+          ? await (session.bot as any)?.getGuildMember?.(session.guildId, userId)
+          : null
+        const got = member?.avatar || member?.user?.avatar
+        if (got) return String(got)
+      } catch (error) {
+        logInfo(`向适配器索取头像失败: ${error}`)
+      }
+      return ''
     }
 
     function extractImagesFromSession(session: Session): string[] {

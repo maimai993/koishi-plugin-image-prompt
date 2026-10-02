@@ -77,6 +77,30 @@ export declare function renderAgentInstructions(template: string, vars: Record<s
  */
 export declare function cleanAskMessage(raw: any, max?: number): string;
 /**
+ * 从用户的回答里判断他要不要润色提示词。
+ * 默认 false —— 用户的原话原封不动交给绘图模型才是对的默认值。
+ */
+export declare function parsePolishIntent(text: string): boolean;
+/** 从消息内容里解析 @ 到的人。type="all"（@全体成员）和 @机器人自己 会被跳过 */
+export declare function extractAtIds(content: string, selfId?: string): {
+    id: string;
+    name: string;
+}[];
+/**
+ * 拼头像地址。优先级：自定义模板 > 适配器直接给的 > 平台内置规则。
+ * 拼不出来返回空字符串（调用方再决定是问适配器还是放弃）。
+ */
+export declare function buildAvatarUrl(input: {
+    userId: string;
+    platform?: string;
+    selfId?: string;
+    appId?: string;
+    /** 发送者自己的头像（适配器已经在消息里带过来了） */
+    authorAvatar?: string;
+    template?: string;
+    size?: number;
+}): string;
+/**
  * 图库容量裁剪：超出容量时淘汰最旧的（按 time 升序），只保留每个组最近 capacity 条
  */
 export declare function trimGallery(records: GalleryRecord[], capacity: number): GalleryRecord[];
@@ -206,6 +230,7 @@ interface CommandConfig {
     referenceGroups?: ReferenceGroup[];
     aiSelector?: AISelectorConfig;
     agent?: AgentConfig;
+    avatar?: AvatarConfig;
     showPrompt?: boolean;
     promptMaxLength?: number;
     appendUserInput?: boolean;
@@ -317,6 +342,23 @@ interface AgentConfig {
     historyTurns: number;
     /** 把每一轮的工具调用打到日志里，方便排查 */
     debugLog: boolean;
+    /** 用户没给任何参考图时，开画前先问一句「要不要参考图」 */
+    askIfNoReference: boolean;
+    /** 开画前先问一句「要不要润色提示词」（默认不润色，原话直出） */
+    askBeforePolish: boolean;
+}
+/** 头像参考图配置 */
+interface AvatarConfig {
+    /** 总开关：能不能拿用户头像当参考图 */
+    enabled: boolean;
+    /** 用户 @ 了谁，就自动把那个人的头像作为参考图（@ 本身就是明确指定） */
+    autoAt: boolean;
+    /** 用户没发图也没 @ 人时，自动拿他自己的头像当参考图 */
+    autoSelf: boolean;
+    /** 头像尺寸（边长像素） */
+    size: number;
+    /** 自定义头像地址模板，留空用内置规则。占位符：{userId} {platform} {selfId} {appId} {size} */
+    urlTemplate: string;
 }
 /** agent 参考图登记表里的一条 */
 export interface RefEntry {
@@ -324,7 +366,7 @@ export interface RefEntry {
     url: string;
     description: string;
     group: string;
-    source: 'gallery' | 'user' | 'cmd';
+    source: 'gallery' | 'user' | 'cmd' | 'avatar';
 }
 /** 交给 AI 挑选的候选图片 */
 interface CandidateImage {

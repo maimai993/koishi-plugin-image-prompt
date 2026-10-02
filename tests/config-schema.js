@@ -169,5 +169,33 @@ check('★ 新开关都是布尔/数字，没混进字符串哨兵', () => {
   assert.strictEqual(typeof cfg.ackOnStart, 'boolean')
 })
 
+check('★ 头像参考图的默认值', () => {
+  const cfg = build({})
+  assert.strictEqual(cfg.avatar.enabled, true, '头像功能默认开')
+  assert.strictEqual(cfg.avatar.autoAt, true, '@ 了谁默认就自动带上谁的头像')
+  assert.strictEqual(cfg.avatar.autoSelf, false, '自己的头像默认不自动带（要用户点头或模型取）')
+  assert.strictEqual(cfg.avatar.size, 640)
+  assert.strictEqual(cfg.avatar.urlTemplate, '')
+})
+
+check('★ 开画前兜底确认的两个开关默认都开', () => {
+  const cfg = build({})
+  assert.strictEqual(cfg.agent.askIfNoReference, true, '没指定参考图时先问一句')
+  assert.strictEqual(cfg.agent.askBeforePolish, true, '开画前先问要不要润色')
+})
+
+check('★ 提示词默认原话直出（不润色）', () => {
+  const cfg = build({})
+  assert.strictEqual(cfg.promptOptimize, 'passthrough')
+})
+
+check('★ 指令模板里写清了「默认不润色、用户点头才润色」', () => {
+  const tpl = build({}).agent.instructions
+  assert.ok(/get_avatar/.test(tpl), '工具清单里要有 get_avatar')
+  assert.ok(/默认不润色|原封不动/.test(tpl), '应写明默认不润色')
+  assert.ok(/polish/.test(tpl), '应说明看 polish 字段决定')
+  assert.ok(/不要替他脑补/.test(tpl), '仍应禁止脑补细节')
+})
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)

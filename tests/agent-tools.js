@@ -18,6 +18,9 @@ const {
   buildAgentTools,
   renderAgentInstructions,
   cleanAskMessage,
+  buildAvatarUrl,
+  extractAtIds,
+  parsePolishIntent,
   AGENT_TOOL_NAMES,
 } = require('../lib/index.js')
 
@@ -227,6 +230,89 @@ check('cleanAskMessage 超长截断', () => {
 check('cleanAskMessage 空值返回空', () => {
   assert.strictEqual(cleanAskMessage(null), '')
   assert.strictEqual(cleanAskMessage('   '), '')
+})
+
+// ---------------- 头像参考图 ----------------
+
+console.log('头像地址：QQ 官方走 qqapp 模板')
+check('buildAvatarUrl: QQ 官方 openid', () => {
+  const url = buildAvatarUrl({ userId: 'A1B2C3', platform: 'qq', appId: '1020test' })
+  assert.strictEqual(url, 'https://q.qlogo.cn/qqapp/1020test/A1B2C3/640')
+})
+
+check('buildAvatarUrl: size 生效', () => {
+  assert.ok(buildAvatarUrl({ userId: 'A1', platform: 'qq', appId: '1020', size: 256 }).endsWith('/256'))
+})
+
+check('buildAvatarUrl: 适配器直接给了头像就直接用（优先于拼接）', () => {
+  const url = buildAvatarUrl({ userId: 'u1', platform: 'qq', appId: '1020', authorAvatar: 'https://cdn/x.png' })
+  assert.strictEqual(url, 'https://cdn/x.png')
+})
+
+check('buildAvatarUrl: onebot 这类拿得到真 QQ 号 -> 通用头像服务', () => {
+  const url = buildAvatarUrl({ userId: '10001', platform: 'onebot' })
+  assert.strictEqual(url, 'https://q1.qlogo.cn/g?b=qq&nk=10001&s=640')
+})
+
+check('buildAvatarUrl: 拼不出来就返回空（交给适配器兜底）', () => {
+  assert.strictEqual(buildAvatarUrl({ userId: 'abc', platform: 'discord' }), '')
+  assert.strictEqual(buildAvatarUrl({ userId: '' }), '')
+})
+
+check('buildAvatarUrl: 自定义模板优先，占位符都能替换', () => {
+  const url = buildAvatarUrl({
+    userId: 'u9', platform: 'qq', selfId: 'bot-1', appId: '1020', size: 128,
+    template: 'https://example.com/{platform}/{appId}/{userId}?s={size}&me={selfId}',
+  })
+  assert.strictEqual(url, 'https://example.com/qq/1020/u9?s=128&me=bot-1')
+})
+
+console.log('@ 解析')
+check('extractAtIds: 解析多个 @ 并按顺序去重', () => {
+  const list = extractAtIds('<at id="u2"/><at id="u3"/><at id="u2"/>', 'bot-1')
+  assert.deepStrictEqual(list.map(x => x.id), ['u2', 'u3'])
+})
+
+check('extractAtIds: 跳过 @机器人自己 和 @全体成员', () => {
+  const list = extractAtIds('<at id="bot-1"/><at type="all"/><at id="u5"/>', 'bot-1')
+  assert.deepStrictEqual(list.map(x => x.id), ['u5'])
+})
+
+check('extractAtIds: 带上名字', () => {
+  const list = extractAtIds('<at id="u2" name="小明"/>', 'bot-1')
+  assert.strictEqual(list[0].name, '小明')
+})
+
+check('extractAtIds: 普通消息不会误判', () => {
+  assert.deepStrictEqual(extractAtIds('帮我画一只猫', 'bot-1'), [])
+})
+
+console.log('润色意图：默认不润色')
+check('parsePolishIntent: 默认/直接画 -> false', () => {
+  assert.strictEqual(parsePolishIntent('直接画'), false)
+  assert.strictEqual(parsePolishIntent(''), false)
+  assert.strictEqual(parsePolishIntent('不用了'), false)
+  assert.strictEqual(parsePolishIntent('原样就好'), false)
+})
+
+check('parsePolishIntent: 说润色 -> true', () => {
+  assert.strictEqual(parsePolishIntent('帮我润色一下'), true)
+  assert.strictEqual(parsePolishIntent('优化一下吧'), true)
+  assert.strictEqual(parsePolishIntent('写详细一点'), true)
+})
+
+check('parsePolishIntent: 「不用润色」不能被认成要润色', () => {
+  assert.strictEqual(parsePolishIntent('不用润色，直接画'), false)
+  assert.strictEqual(parsePolishIntent('别润色'), false)
+})
+
+console.log('工具清单里有 get_avatar')
+check('AGENT_TOOL_NAMES / buildAgentTools 都包含 get_avatar', () => {
+  assert.ok(AGENT_TOOL_NAMES.includes('get_avatar'))
+  const names = buildAgentTools().map(t => t.function.name)
+  assert.deepStrictEqual(names, ['gallery_search', 'ask_user', 'get_avatar', 'draw'])
+  const avatar = buildAgentTools().find(t => t.function.name === 'get_avatar')
+  assert.deepStrictEqual(avatar.function.parameters.required, [], 'userId 应可省略（省略=取自己的）')
 })
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
