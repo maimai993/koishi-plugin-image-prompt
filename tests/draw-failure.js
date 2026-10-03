@@ -130,7 +130,7 @@ async function run(scripts, options = {}) {
     // 这个探针测的是「绘图失败怎么处理」，开画前的兜底询问会挡住第一次 draw，关掉
     agent: {
       enabled: true, maxIterations: 6, maxSelect: 3, askTimeout: 2,
-      confirmBeforeDraw: false, historyTurns: 0, debugLog: false,
+      confirmBeforeDraw: false, debugLog: false,
       askIfNoReference: false, askBeforePolish: false,
     },
     resultGallery: { enabled: false },

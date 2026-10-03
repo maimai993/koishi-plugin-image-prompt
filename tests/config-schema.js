@@ -60,8 +60,19 @@ check('★ Agent 各项默认值合理', () => {
   assert.strictEqual(cfg.agent.askTimeout, 120)
   assert.strictEqual(cfg.agent.timeout, 120)
   assert.strictEqual(cfg.agent.maxTokens, 8000)
-  assert.strictEqual(cfg.agent.historyTurns, 6)
   assert.strictEqual(cfg.agent.debugLog, false)
+})
+
+check('★ 不再有「跨任务记忆」配置项（每次任务上下文都是空的）', () => {
+  const cfg = build({})
+  assert.ok(!('historyTurns' in cfg.agent), 'historyTurns 应已删除')
+  // Schema.intersect 不剥离未知字段，老配置里的 historyTurns 会原样透传，
+  // 但只要它不再出现在 Schema 定义里（代码也不读），就等于没有。
+  let thrown = ''
+  try { build({ agent: { historyTurns: 6 } }) } catch (error) { thrown = error.message }
+  assert.strictEqual(thrown, '', `老配置残留不应把解析搞崩：${thrown}`)
+  const keys = JSON.stringify(plugin.Config)
+  assert.ok(!keys.includes('historyTurns'), 'Schema 里不应再有 historyTurns 定义')
 })
 
 check('★ Agent 指令模板：说了三个工具 + 带开画确认占位符', () => {

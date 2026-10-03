@@ -338,8 +338,6 @@ interface AgentConfig {
     temperature: number;
     /** 单次回复的输出长度上限。推理模型会把额度耗在思考上，太小会一个字都生成不出来 */
     maxTokens: number;
-    /** 记住当前频道最近几轮对话（0 = 不记忆） */
-    historyTurns: number;
     /** 把每一轮的工具调用打到日志里，方便排查 */
     debugLog: boolean;
     /** 用户没给任何参考图时，开画前先问一句「要不要参考图」 */

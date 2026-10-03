@@ -170,7 +170,6 @@ async function run(scripts, options = {}) {
       searchLimit: 12,
       askTimeout: 3,
       confirmBeforeDraw: true,
-      historyTurns: 6,
       debugLog: false,
       ...options.agent,
     },
@@ -212,7 +211,10 @@ async function run(scripts, options = {}) {
   const action = cmd._actions[cmd._actions.length - 1]
 
   const results = []
+  // 每次命令产生的 calls 区间，用来断言「第二次任务带了什么」
+  const marks = []
   for (const userText of userTexts) {
+    const markStart = calls.length
     const fullMessage = `/画图/测试${userText ? ' ' + userText : ''}`
 
     // 用户随消息发的图 / @ 的人：拼进原始 content。
@@ -254,6 +256,7 @@ async function run(scripts, options = {}) {
       if (process.env.DEBUG_E2E) console.log('    [debug] ' + String(error.stack).split('\n').slice(0, 6).join('\n'))
     }
     results.push(result)
+    marks.push({ text: userText, start: markStart, end: calls.length })
     if (options.top?.backgroundDrawing?.enabled) await new Promise(r => setTimeout(r, 80))
   }
 
@@ -261,7 +264,7 @@ async function run(scripts, options = {}) {
 
   const agentCalls = calls.filter(c => c.isAgent)
   const drawCalls = calls.filter(c => !c.isAgent)
-  return { calls, agentCalls, drawCalls, result: results, sent, userTexts }
+  return { calls, agentCalls, drawCalls, result: results, sent, userTexts, marks }
 }
 
 /** 把发出去的消息 + 返回值拍平成一段文本 */
@@ -490,21 +493,28 @@ async function main() {
     })
   }
 
-  console.log('7) 同一频道记住上一轮（「再画一张」能接上）')
+  console.log('7) 每次任务都是全新上下文：上一轮的对话不带进下一轮')
   {
     const r = await run([
       [{ toolCalls: [{ name: 'draw', args: { prompt: 'first one' } }] }, '第一张好了'],
       ['再画一张'],
     ], { userTexts: ['白发少女', '再画一张'], maxImages: 0, defaultImageUrls: ['https://img/default.png'] })
 
-    check('★ 第二次请求带上了上一轮的对话', () => {
-      const calls = r.agentCalls
-      assert.ok(calls.length >= 2, `至少 2 次 agent 请求，实际 ${calls.length}`)
-      const second = calls[calls.length - 1]
-      const all = messagesOf(second)
-      assert.ok(all.includes('白发少女'), '应记得上一轮用户说的话')
-      assert.ok(all.includes('第一张好了'), '应记得上一轮助手说的话')
+    const secondCalls = r.calls.slice(r.marks[1].start)
+
+    check('★ 第二次任务的请求里没有上一轮的任何内容', () => {
+      assert.ok(secondCalls.length > 0, '第二次任务应发出 agent 请求')
+      const all = JSON.stringify(secondCalls.map(c => c.body.messages))
+      assert.ok(!all.includes('白发少女'), '不该记得上一轮用户说的话')
+      assert.ok(!all.includes('第一张好了'), '不该记得上一轮助手说的话')
+      assert.ok(!all.includes('first one'), '不该带着上一轮的提示词')
       assert.ok(all.includes('再画一张'), '应带上这一轮的输入')
+    })
+    check('第二次任务从 system + 本轮 user 两条起步（没有历史尾巴）', () => {
+      const first = secondCalls[0]
+      assert.strictEqual(first.body.messages[0].role, 'system', '第一条应是 system')
+      assert.strictEqual(first.body.messages[1].role, 'user', '第二条应是本轮的用户输入')
+      assert.strictEqual(first.body.messages[1].content, '再画一张')
     })
   }
 

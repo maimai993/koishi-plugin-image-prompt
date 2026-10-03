@@ -1082,8 +1082,6 @@ interface AgentConfig {
   temperature: number
   /** 单次回复的输出长度上限。推理模型会把额度耗在思考上，太小会一个字都生成不出来 */
   maxTokens: number
-  /** 记住当前频道最近几轮对话（0 = 不记忆） */
-  historyTurns: number
   /** 把每一轮的工具调用打到日志里，方便排查 */
   debugLog: boolean
   /** 用户没给任何参考图时，开画前先问一句「要不要参考图」 */
@@ -1768,7 +1766,6 @@ export const Config: Schema = Schema.intersect([
       timeout: Schema.number().default(120).min(10).max(600).step(10).description('单次模型请求超时（秒）'),
       temperature: Schema.number().default(0.3).min(0).max(2).step(0.1).description('agent 循环用的采样温度'),
       maxTokens: Schema.number().default(8000).min(0).max(64000).step(500).description('agent 单次回复的输出长度上限。**推理模型会把额度耗在思考上**，太小会一个字都生成不出来。0 = 不限制'),
-      historyTurns: Schema.number().default(6).min(0).max(30).step(1).description('记住当前频道最近几轮对话（让「再画一张」「换个风格」能接上），0 = 不记忆'),
       debugLog: Schema.boolean().default(false).description('把 agent 每一轮的模型输出与工具调用写进日志，排查用'),
       model: Schema.string().description('agent 专用的模型（留空则用「AI 模型接口」里的模型）。**需要支持 function calling**；不支持时插件会自动改用「一行 JSON」协议'),
       baseUrl: Schema.string().role('link').description('agent 专用接口地址（留空则复用「AI 模型接口」的地址）'),
@@ -2001,14 +1998,8 @@ export function apply(ctx: Context, config: CommandConfig) {
     await bot.sendMessage(channelId, body, guildId)
   }
 
-  // 每个频道最近几轮的对话（agent 记忆，只存纯文本，重启即失效）
-  const agentHistories = new Map<string, any[]>()
   /** 「agent 接口地址没单独配」这条警告只打一次，别刷屏 */
   let agentUrlWarned = false
-
-  function agentHistoryKey(session: Session): string {
-    return `${session.platform}:${session.channelId || session.userId || ''}`
-  }
 
   ctx.on('ready', () => {
 
@@ -2120,7 +2111,6 @@ export function apply(ctx: Context, config: CommandConfig) {
       const askTimeout = agentCfg.askTimeout || 120
       const maxSelect = agentCfg.maxSelect || 3
       const searchLimit = agentCfg.searchLimit || 12
-      const historyTurns = typeof agentCfg.historyTurns === 'number' ? agentCfg.historyTurns : 6
 
       // ---- 参考图登记表：模型只能用它拿到的编号去引用图片 ----
       const registry = new Map<string, RefEntry>()
@@ -2190,21 +2180,14 @@ export function apply(ctx: Context, config: CommandConfig) {
 
       logInfo(`[${cmdConfig.name}] agent 启动：可搜索参考图 ${pool.length} 张，默认图 ${baseIds.length} 张，用户随消息发的图 ${userIds.length} 张，头像 ${atAvatarIds.length + (selfAvatarId ? 1 : 0)} 张`)
 
-      // ---- 历史（同一频道记住最近几轮，让「再画一张」能接上）----
-      const historyKey = agentHistoryKey(session)
-      const history = historyTurns > 0 ? (agentHistories.get(historyKey) || []).slice() : []
-      const newHistory: any[] = []
-      const remember = (msg: any) => { if (historyTurns > 0) newHistory.push(msg) }
-      remember({ role: 'user', content: userInputText || '（用户没有附加说明）' })
-
+      // 上下文是**每次任务一份**：上一次任务的提问、参考图编号、模型脑补出来的东西
+      // 一律不往下传，否则会串味（把上一轮的参考图塞进这一轮、接着上一轮的问话继续问）。
       const messages: any[] = [
         { role: 'system', content: buildAgentSystemPrompt(cmdConfig, userInputText, pool.length, {
           userIds, baseIds, atAvatarIds, selfAvatarId, atTargets, selfUserId: session.userId,
         }, agentCfg, avatarAllowed) },
-        ...history,
         { role: 'user', content: userInputText ? userInputText : '（用户没有附加说明，请按指令自带的提示词来）' },
       ]
-      if (history.length) logInfo(`agent 带上 ${history.length} 条历史上下文`)
 
       const tools = buildAgentTools()
       let toolsSupported = true
@@ -2266,12 +2249,6 @@ export function apply(ctx: Context, config: CommandConfig) {
       if (!finalText && failed) finalText = session.text('image-prompt.messages.agentfailed', [failed])
       if (!finalText && !drew) finalText = session.text('image-prompt.messages.agentnoresult')
 
-      remember({ role: 'assistant', content: finalText || '（已经把图发出去了）' })
-      if (historyTurns > 0) {
-        agentHistories.set(historyKey, [...history, ...newHistory].slice(-(historyTurns * 2)))
-        // 频道太多时清一下，避免无限增长
-        if (agentHistories.size > 200) agentHistories.clear()
-      }
       return finalText
 
       // ---------------- 工具实现 ----------------
@@ -2358,7 +2335,6 @@ export function apply(ctx: Context, config: CommandConfig) {
           ctx.logger.warn(`等待用户回复时出错: ${error}`)
         }
 
-        remember({ role: 'assistant', content: question })
         if (answer === undefined || answer === null) {
           return JSON.stringify({
             ok: false, timeout: true,
@@ -2369,7 +2345,6 @@ export function apply(ctx: Context, config: CommandConfig) {
         const text = extractTextFromMessage(answer)
         const images = extractImagesFromMessage(answer)
         const ids = images.map(url => register('user', url, '', '用户发送'))
-        remember({ role: 'user', content: text || (ids.length ? `（用户发了 ${ids.length} 张图片）` : '（用户什么都没说）') })
         logInfo(`agent 提问「${question}」-> 用户回复: ${text || '（无文字）'}，图片 ${ids.length} 张`)
 
         // 回复里 @ 了谁 / 说「用我的头像」→ 把对应头像也登记进来
